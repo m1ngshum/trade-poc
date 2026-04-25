@@ -1,32 +1,44 @@
 import "dotenv/config";
 import { z } from "zod";
 
-const ConfigSchema = z.object({
-  EXCHANGE: z.string().default("binance"),
-  SYMBOLS: z
-    .string()
-    .default("BTC/USDT")
-    .transform((s) =>
-      s
-        .split(",")
-        .map((x) => x.trim())
-        .filter(Boolean),
-    ),
-  TIMEFRAME: z.string().default("15m"),
-  CYCLE_INTERVAL_MIN: z.coerce.number().positive().default(15),
+const ConfigSchema = z
+  .object({
+    EXCHANGE: z.string().default("binance"),
+    SYMBOLS: z
+      .string()
+      .default("BTC/USDT")
+      .transform((s) =>
+        s
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean),
+      ),
+    TIMEFRAME: z.string().default("15m"),
+    CYCLE_INTERVAL_MIN: z.coerce.number().positive().default(15),
 
-  OPENROUTER_API_KEY: z.string().min(1, "OPENROUTER_API_KEY is required"),
-  LLM_MODEL: z.string().default("anthropic/claude-sonnet-4.6"),
-  SELF_CONSISTENCY_N: z.coerce.number().int().min(1).max(9).default(3),
+    LLM_PROVIDER: z.enum(["openrouter", "claude-cli"]).default("openrouter"),
+    OPENROUTER_API_KEY: z.string().optional(),
+    LLM_MODEL: z.string().default("anthropic/claude-sonnet-4.6"),
+    SELF_CONSISTENCY_N: z.coerce.number().int().min(1).max(9).default(3),
+    CLAUDE_CLI_PATH: z.string().default("claude"),
 
-  INITIAL_EQUITY: z.coerce.number().positive().default(10_000),
-  MAX_POSITION_PCT: z.coerce.number().positive().max(100).default(20),
-  DAILY_LOSS_LIMIT_PCT: z.coerce.number().positive().default(3),
-  MAX_DRAWDOWN_PCT: z.coerce.number().positive().default(15),
+    INITIAL_EQUITY: z.coerce.number().positive().default(10_000),
+    MAX_POSITION_PCT: z.coerce.number().positive().max(100).default(20),
+    DAILY_LOSS_LIMIT_PCT: z.coerce.number().positive().default(3),
+    MAX_DRAWDOWN_PCT: z.coerce.number().positive().default(15),
 
-  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
-  DB_PATH: z.string().default("./data/journal.db"),
-});
+    LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+    DB_PATH: z.string().default("./data/journal.db"),
+  })
+  .superRefine((v, ctx) => {
+    if (v.LLM_PROVIDER === "openrouter" && !v.OPENROUTER_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["OPENROUTER_API_KEY"],
+        message: "OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter",
+      });
+    }
+  });
 
 const parsed = ConfigSchema.safeParse(process.env);
 if (!parsed.success) {
