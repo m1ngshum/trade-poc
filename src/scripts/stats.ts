@@ -1,13 +1,31 @@
 import { CONFIG } from "../config.js";
 import { closeDb, getStats } from "../journal/db.js";
 
-// USD per 1M tokens. Update if you change LLM_MODEL — these are OpenRouter
-// list prices for Anthropic models (input, output).
+// USD per 1M tokens (Anthropic April 2026 list prices). Keyed by every model
+// string that any provider might emit — OpenRouter (`anthropic/<name>`),
+// Claude CLI canonical (`claude-<family>-<x>-<y>`), and the short aliases
+// (`sonnet`/`opus`/`haiku`, which we map to the latest of each family).
 const PRICING: Record<string, { input: number; output: number }> = {
+  // Sonnet 4.6 / 4.5 — same price
   "anthropic/claude-sonnet-4.6": { input: 3, output: 15 },
   "anthropic/claude-sonnet-4.5": { input: 3, output: 15 },
+  "claude-sonnet-4-6": { input: 3, output: 15 },
+  "claude-sonnet-4-5": { input: 3, output: 15 },
+  sonnet: { input: 3, output: 15 },
+
+  // Opus 4.7 / 4.6 / 4.5
   "anthropic/claude-opus-4.7": { input: 15, output: 75 },
+  "anthropic/claude-opus-4.6": { input: 15, output: 75 },
+  "anthropic/claude-opus-4.5": { input: 15, output: 75 },
+  "claude-opus-4-7": { input: 15, output: 75 },
+  "claude-opus-4-6": { input: 15, output: 75 },
+  "claude-opus-4-5": { input: 15, output: 75 },
+  opus: { input: 15, output: 75 },
+
+  // Haiku 4.5
   "anthropic/claude-haiku-4.5": { input: 1, output: 5 },
+  "claude-haiku-4-5": { input: 1, output: 5 },
+  haiku: { input: 1, output: 5 },
 };
 
 const s = getStats();
@@ -29,7 +47,7 @@ const lines = [
   `Win rate:           ${winRate.toFixed(1)}%`,
   `Total realized PnL: $${s.totalPnlUsd.toFixed(2)}`,
   `Tokens:             prompt=${s.totalPromptTokens.toLocaleString()}  completion=${s.totalCompletionTokens.toLocaleString()}`,
-  `LLM spend:          ${usd != null ? `$${usd.toFixed(4)}` : "(unknown — add pricing for this model)"}`,
+  `LLM spend:          ${usd != null ? `$${usd.toFixed(4)}` : `(no pricing entry for "${CONFIG.LLM_MODEL}" — add one to src/scripts/stats.ts)`}`,
 ];
 
 // eslint-disable-next-line no-console

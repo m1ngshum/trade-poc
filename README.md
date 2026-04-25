@@ -71,3 +71,141 @@ CCXT  →  indicators  →  MarketStatePacket  →  LLM (×N, vote)
 - With `LLM_PROVIDER=openrouter`, the static system prompt is sent with `cache_control: ephemeral`, which OpenRouter forwards to Claude models. With `LLM_PROVIDER=claude-cli`, caching is whatever the harness applies internally.
 - Stop-loss / take-profit are enforced between cycles (not real exchange orders) by checking the open position against the latest mid-price each cycle.
 - The journal is the source of truth; `stats.ts` reads it, `print-journal.ts` reads it. Equity does not persist across restarts in v0.1 — the `INITIAL_EQUITY` resets each launch.
+
+---
+
+## Recipes (copy-paste)
+
+### A) Run on OpenRouter (default, fastest path)
+
+```bash
+# one-time
+npm install
+cp .env.example .env
+
+# then edit .env — at minimum:
+#   LLM_PROVIDER=openrouter
+#   OPENROUTER_API_KEY=sk-or-v1-...
+#   LLM_MODEL=anthropic/claude-sonnet-4.6
+#   SYMBOLS=BTC/USDT
+#   SELF_CONSISTENCY_N=3
+
+npm run dev
+# press `r` to force a cycle, `q` to quit
+```
+
+### B) Run on Claude CLI (hardened, billed via ANTHROPIC_API_KEY)
+
+```bash
+# Prereqs: `claude` CLI on PATH and an Anthropic Console API key.
+which claude && claude --version
+
+# .env
+LLM_PROVIDER=claude-cli
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_MODEL=sonnet                  # or claude-sonnet-4-6
+LLM_FALLBACK_MODEL=claude-haiku-4-5
+SELF_CONSISTENCY_N=1              # start at 1 to gauge spend; raise after
+SYMBOLS=BTC/USDT
+
+npm run dev
+```
+
+The dashboard's LAST DECISION block shows `Cost: $0.00X` per cycle (sum of all self-consistency samples). Set a hard cap on Console auto-reload before letting this run unattended.
+
+### C) Smoke-test a single cycle without launching the dashboard
+
+```bash
+# Forces config validation and one full pipeline pass for the first symbol.
+# Useful in CI / cron / preflight checks.
+npx tsx -e '
+  process.env.SYMBOLS = process.env.SYMBOLS || "BTC/USDT";
+  const { fetchOHLCV, fetchTicker } = await import("./src/data/market.js");
+  const { computeIndicators, computeChanges, timeframeMinutes } = await import("./src/data/indicators.js");
+  const { classifyRegime } = await import("./src/data/regime.js");
+  const { decide } = await import("./src/agent/brain.js");
+  const { evaluate } = await import("./src/risk/engine.js");
+  const { CONFIG } = await import("./src/config.js");
+
+  const sym = CONFIG.SYMBOLS[0];
+  const [c, t] = await Promise.all([fetchOHLCV(sym), fetchTicker(sym)]);
+  const ind = computeIndicators(c);
+  const ch = computeChanges(c, timeframeMinutes(CONFIG.TIMEFRAME));
+  const packet = {
+    symbol: sym, timestamp: new Date().toISOString(), price: t.last,
+    ...ch, ...ind, volume_24h_usd: t.quoteVolume24h,
+    regime: classifyRegime(ind, t.last),
+    open_position: { side: "none", entry_price: 0, unrealized_pnl_pct: 0 },
+    equity_usd: CONFIG.INITIAL_EQUITY, daily_pnl_pct: 0, last_3_trades: [],
+  };
+  const r = await decide(packet);
+  console.log("intent:", r.intent.action, "conf:", r.intent.confidence,
+              "tokens:", r.usage.prompt_tokens + r.usage.completion_tokens,
+              "cost:", r.usage.cost_usd ?? "(n/a)");
+  const v = evaluate({ intent: r.intent, packet });
+  console.log("verdict:", v.verdict, v.reason ?? "");
+'
+```
+
+### D) Tail the journal during a run
+
+```bash
+# Last 30 decisions (one row per cycle):
+npm run journal
+
+# Aggregate stats:
+npm run stats
+
+# Raw SQL, e.g. all REJECTs in the last hour:
+sqlite3 data/journal.db "SELECT timestamp, symbol, reject_reason
+  FROM decisions
+  WHERE risk_verdict='REJECT' AND timestamp > datetime('now', '-1 hour')
+  ORDER BY timestamp DESC;"
+
+# Live tail of the agent log (separate terminal):
+tail -f data/agent.log
+```
+
+### E) Force each risk-engine reject path (sanity check before letting it run unattended)
+
+```bash
+# 1) SIZE_CAP — small position cap, watch a >1% intent get rejected.
+MAX_POSITION_PCT=1 npm run dev
+
+# 2) DAILY_LOSS_LIMIT — first losing close should trip it.
+DAILY_LOSS_LIMIT_PCT=0.01 npm run dev
+
+# 3) MAX_DRAWDOWN — first losing close should HALT the loop.
+MAX_DRAWDOWN_PCT=0.01 npm run dev
+```
+
+In all three cases, `npm run journal` afterwards will show the reject reason in the rightmost column.
+
+### F) Reset a session (wipe paper state and journal)
+
+```bash
+rm -f data/journal.db data/agent.log
+# Equity does not persist across restarts in v0.1 — `INITIAL_EQUITY` from .env
+# is what you start fresh with on the next `npm run dev`.
+```
+
+### G) Cron / systemd long-run (OpenRouter)
+
+```bash
+# /etc/systemd/system/crypto-agent.service
+[Unit]
+Description=crypto-agent-cli
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/user/trade-poc
+EnvironmentFile=/home/user/trade-poc/.env
+ExecStart=/usr/bin/env npm run dev
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Note: the Ink dashboard expects a TTY. Under systemd you'll want to either redirect the dashboard away (the journal + agent.log are the source of truth anyway) or run inside `tmux`/`screen`. For headless deploys, plan to add a `--no-dashboard` flag in v0.2.
