@@ -28,7 +28,7 @@ See `.env.example`. Key knobs:
 
 - `SYMBOLS` — comma-separated watchlist (default `BTC/USDT,ETH/USDT`).
 - `TIMEFRAME` / `CYCLE_INTERVAL_MIN` — keep these matched (default `15m` / `15`).
-- `LLM_PROVIDER` — `openrouter` (default) or `claude-cli`. See below.
+- `LLM_PROVIDER` — `openrouter` (default), `claude-cli`, or `claude-cli-oauth`. See below.
 - `LLM_MODEL` — model id, format depends on provider.
 - `SELF_CONSISTENCY_N` — how many parallel LLM samples per cycle (default 3, majority-vote on `action`).
 - `MAX_POSITION_PCT`, `DAILY_LOSS_LIMIT_PCT`, `MAX_DRAWDOWN_PCT` — risk guardrails. The drawdown breach halts the loop with a banner.
@@ -48,10 +48,18 @@ claude -p --bare --no-session-persistence \
 
 `LLM_MODEL` uses the CLI's own naming (`sonnet`, `claude-sonnet-4-6`, etc). Set `LLM_FALLBACK_MODEL` to enable automatic failover when the primary is overloaded.
 
-**Billing — read this before running.** `--bare` skips OAuth and keychain reads, so this provider **always** bills against `ANTHROPIC_API_KEY` (Anthropic Console credits). Per Anthropic's [Agent SDK overview](https://platform.claude.com/docs/en/agent-sdk/overview), subscription (Pro/Max) auth is not supported for third-party agents. Set up Console auto-reload with a hard cap to avoid surprises. The dashboard surfaces `total_cost_usd` per cycle.
+**Billing — read this before running.** `--bare` skips OAuth and keychain reads, so this provider **always** bills against `ANTHROPIC_API_KEY` (Anthropic Console credits). Set up Console auto-reload with a hard cap to avoid surprises. The dashboard surfaces `total_cost_usd` per cycle. This is the path Anthropic sanctions for automated agents.
 
-Other trade-offs:
-- Each self-consistency sample spawns a separate subprocess (~3–8s per sample plus harness boot). Start with `SELF_CONSISTENCY_N=1` to gauge spend.
+**`claude-cli-oauth`** — same hardened lockdown (`--permission-mode dontAsk --allowedTools "" --json-schema`), but **drops `--bare`** so the CLI's logged-in OAuth session (Pro/Max subscription) is used. `ANTHROPIC_API_KEY` is not required and is **scrubbed from the subprocess env** if set, so the CLI cannot accidentally fall through to API-key billing.
+
+Caveats specific to OAuth mode:
+- Per Anthropic's [Agent SDK overview](https://platform.claude.com/docs/en/agent-sdk/overview), subscription-backed third-party agents are not officially supported. Personal use on your own machine is the gray area.
+- Rate limits are shared with your claude.ai usage. Heavy interactive use elsewhere can throttle the bot.
+- Without `--bare`, the CLI auto-discovers your `~/.claude` settings, MCP servers, and any `CLAUDE.md` in the bot's cwd. The trade-poc directory has no `CLAUDE.md`, but check your user-level config for hooks that might fire on every cycle.
+- `total_cost_usd` from the CLI is typically `0` under subscription billing, so the dashboard's `Cost:` line will show `$0.0000`. `npm run stats` falls back to estimating from tokens × API list prices, which over-reports your actual subscription spend (which is just your monthly fee).
+
+Other trade-offs (both modes):
+- Each self-consistency sample spawns a separate subprocess (~3–8s per sample plus harness boot). Start with `SELF_CONSISTENCY_N=1`.
 - `--permission-mode dontAsk` + empty allowlist denies every tool the model might try; `--json-schema` enforces structured output at the harness layer (no prompt-following lottery).
 
 ## Architecture
@@ -112,6 +120,35 @@ npm run dev
 ```
 
 The dashboard's LAST DECISION block shows `Cost: $0.00X` per cycle (sum of all self-consistency samples). Set a hard cap on Console auto-reload before letting this run unattended.
+
+### B-OAuth) Run on Claude Max/Pro subscription (gray-area, no API credits)
+
+```bash
+# Prereqs:
+which claude && claude --version
+# 1. Make sure `claude` is signed into your subscription. Easiest:
+claude          # interactive — pick "Sign in with Claude" if not already
+# Then exit, and verify:
+claude /status  # should show your subscription tier
+
+# 2. CRITICAL — make sure ANTHROPIC_API_KEY is NOT set in the env you'll
+#    launch the bot from, or the bot will warn and scrub it for safety.
+unset ANTHROPIC_API_KEY
+
+# .env
+LLM_PROVIDER=claude-cli-oauth
+LLM_MODEL=sonnet                  # or claude-sonnet-4-6
+LLM_FALLBACK_MODEL=claude-haiku-4-5
+SELF_CONSISTENCY_N=1              # subscription rate limits are shared with claude.ai
+SYMBOLS=BTC/USDT
+# (do NOT set ANTHROPIC_API_KEY in .env)
+
+npm run dev
+```
+
+You'll see two warnings at startup confirming you're on the OAuth path. The dashboard's `Cost:` line will read `$0.0000` (subscription doesn't itemize per-call); your real spend is just your monthly subscription fee.
+
+If `npm run dev` errors with auth/permission issues, run `claude` interactively once first to refresh the OAuth token, then retry.
 
 ### C) Smoke-test a single cycle without launching the dashboard
 

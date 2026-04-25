@@ -16,7 +16,9 @@ const ConfigSchema = z
     TIMEFRAME: z.string().default("15m"),
     CYCLE_INTERVAL_MIN: z.coerce.number().positive().default(15),
 
-    LLM_PROVIDER: z.enum(["openrouter", "claude-cli"]).default("openrouter"),
+    LLM_PROVIDER: z
+      .enum(["openrouter", "claude-cli", "claude-cli-oauth"])
+      .default("openrouter"),
     OPENROUTER_API_KEY: z.string().optional(),
     ANTHROPIC_API_KEY: z.string().optional(),
     LLM_MODEL: z.string().default("anthropic/claude-sonnet-4.6"),
@@ -63,3 +65,21 @@ if (!parsed.success) {
 
 export const CONFIG = parsed.data;
 export type Config = typeof CONFIG;
+
+// Loud startup notices that don't belong as schema errors.
+if (CONFIG.LLM_PROVIDER === "claude-cli-oauth") {
+  // eslint-disable-next-line no-console
+  console.warn(
+    "[config] LLM_PROVIDER=claude-cli-oauth — using your local `claude` CLI's " +
+      "OAuth login (subscription billing). Anthropic does not officially support " +
+      "subscription-backed automated agents; rate limits are shared with claude.ai usage.",
+  );
+  if (CONFIG.ANTHROPIC_API_KEY) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[config] ANTHROPIC_API_KEY is set in your env. The CLI normally prefers " +
+        "API-key auth over OAuth, which would defeat oauth mode — the provider " +
+        "scrubs it from the spawned subprocess to keep you on subscription.",
+    );
+  }
+}

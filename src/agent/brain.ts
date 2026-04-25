@@ -11,6 +11,7 @@ function selectProvider(): Provider {
     case "openrouter":
       return openrouterProvider;
     case "claude-cli":
+    case "claude-cli-oauth":
       return claudeCliProvider;
     default: {
       const _exhaustive: never = CONFIG.LLM_PROVIDER;

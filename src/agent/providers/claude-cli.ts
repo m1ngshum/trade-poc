@@ -25,26 +25,33 @@ const SPAWN_TIMEOUT_MS = 90_000;
 /**
  * Drives the local `claude` CLI in non-interactive print mode.
  *
- * Lockdown posture:
- *   --bare                       no hooks/skills/MCP/CLAUDE.md auto-discovery
+ * Lockdown posture (both modes):
  *   --no-session-persistence     leaves no junk session files behind
  *   --permission-mode dontAsk    deny anything not in the allowlist
  *   --allowedTools ""            empty allowlist → model has no tools
  *   --json-schema <Intent>       harness-level structured output enforcement
  *
- * Billing: `--bare` skips OAuth and keychain reads, so this provider always
- * runs against ANTHROPIC_API_KEY (Anthropic Console credits). Subscription
- * (Pro/Max) auth is not supported by this path and not endorsed by Anthropic
- * for automated agents. config.ts enforces ANTHROPIC_API_KEY at startup.
+ * Billing modes (CONFIG.LLM_PROVIDER):
+ *   "claude-cli"        adds --bare. Skips OAuth/keychain; ALWAYS bills
+ *                       against ANTHROPIC_API_KEY (Anthropic Console credits).
+ *                       Sanctioned by Anthropic for automated agents.
+ *   "claude-cli-oauth"  drops --bare. Uses the CLI's logged-in OAuth
+ *                       (Pro/Max subscription). Scrubs ANTHROPIC_API_KEY from
+ *                       the subprocess env so the CLI can't accidentally fall
+ *                       through to API-key billing. Anthropic does not
+ *                       officially support subscription-backed agents; rate
+ *                       limits are shared with claude.ai usage.
  */
 export const claudeCliProvider: Provider = async (
   _packet,
   systemPrompt,
   userMessage,
 ) => {
-  const args = [
-    "-p",
-    "--bare",
+  const useOauth = CONFIG.LLM_PROVIDER === "claude-cli-oauth";
+
+  const args: string[] = ["-p"];
+  if (!useOauth) args.push("--bare");
+  args.push(
     "--no-session-persistence",
     "--permission-mode",
     "dontAsk",
@@ -58,15 +65,25 @@ export const claudeCliProvider: Provider = async (
     systemPrompt,
     "--model",
     CONFIG.LLM_MODEL,
-  ];
+  );
   if (CONFIG.LLM_FALLBACK_MODEL) {
     args.push("--fallback-model", CONFIG.LLM_FALLBACK_MODEL);
   }
   args.push(userMessage);
 
+  // In oauth mode, scrub ANTHROPIC_API_KEY from the spawned env. The CLI's
+  // auth priority is API key > --bare > OAuth, so leaving the env var in place
+  // would silently flip billing to API credits.
+  const childEnv: NodeJS.ProcessEnv = useOauth
+    ? Object.fromEntries(
+        Object.entries(process.env).filter(([k]) => k !== "ANTHROPIC_API_KEY"),
+      )
+    : process.env;
+
   const stdout = await new Promise<string>((resolve, reject) => {
     const child = spawn(CONFIG.CLAUDE_CLI_PATH, args, {
       stdio: ["ignore", "pipe", "pipe"],
+      env: childEnv,
     });
     let out = "";
     let err = "";
