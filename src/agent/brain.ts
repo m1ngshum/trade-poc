@@ -21,7 +21,11 @@ function selectProvider(): Provider {
 
 export interface BrainResult {
   intent: Intent;
-  usage: { prompt_tokens: number; completion_tokens: number };
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    cost_usd?: number;
+  };
   samples: number;
   votes: Record<Intent["action"], number>;
 }
@@ -30,6 +34,7 @@ interface SampleResult {
   intent: Intent | null;
   prompt_tokens: number;
   completion_tokens: number;
+  cost_usd?: number;
   raw: string;
 }
 
@@ -62,6 +67,7 @@ async function sampleOnce(packet: MarketStatePacket): Promise<SampleResult> {
     intent: parsed,
     prompt_tokens: result.usage.prompt_tokens,
     completion_tokens: result.usage.completion_tokens,
+    cost_usd: result.costUsd,
     raw: result.raw,
   };
 }
@@ -90,10 +96,14 @@ export async function decide(packet: MarketStatePacket): Promise<BrainResult> {
     else logger.warn(`LLM sample errored: ${(r.reason as Error)?.message}`);
   }
 
-  const usage = samples.reduce(
+  const usage = samples.reduce<BrainResult["usage"]>(
     (acc, s) => ({
       prompt_tokens: acc.prompt_tokens + s.prompt_tokens,
       completion_tokens: acc.completion_tokens + s.completion_tokens,
+      cost_usd:
+        s.cost_usd === undefined
+          ? acc.cost_usd
+          : (acc.cost_usd ?? 0) + s.cost_usd,
     }),
     { prompt_tokens: 0, completion_tokens: 0 },
   );

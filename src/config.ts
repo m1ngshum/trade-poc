@@ -18,7 +18,9 @@ const ConfigSchema = z
 
     LLM_PROVIDER: z.enum(["openrouter", "claude-cli"]).default("openrouter"),
     OPENROUTER_API_KEY: z.string().optional(),
+    ANTHROPIC_API_KEY: z.string().optional(),
     LLM_MODEL: z.string().default("anthropic/claude-sonnet-4.6"),
+    LLM_FALLBACK_MODEL: z.string().optional(),
     SELF_CONSISTENCY_N: z.coerce.number().int().min(1).max(9).default(3),
     CLAUDE_CLI_PATH: z.string().default("claude"),
 
@@ -36,6 +38,14 @@ const ConfigSchema = z
         code: z.ZodIssueCode.custom,
         path: ["OPENROUTER_API_KEY"],
         message: "OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter",
+      });
+    }
+    if (v.LLM_PROVIDER === "claude-cli" && !v.ANTHROPIC_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["ANTHROPIC_API_KEY"],
+        message:
+          "ANTHROPIC_API_KEY is required when LLM_PROVIDER=claude-cli (--bare skips OAuth/keychain; subscription auth is not supported)",
       });
     }
   });

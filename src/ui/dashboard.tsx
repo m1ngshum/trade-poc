@@ -149,6 +149,9 @@ const App: React.FC<DashboardProps> = ({ onForceCycle, onQuit }) => {
           {"  "}Risk: <Text color={verdictColor}>{snap.verdict}</Text>
           {snap.rejectReason ? <Text dimColor> ({snap.rejectReason})</Text> : null}
           {"   "}Tokens: {snap.brain.usage.prompt_tokens + snap.brain.usage.completion_tokens}
+          {snap.brain.usage.cost_usd !== undefined ? (
+            <Text>   Cost: ${snap.brain.usage.cost_usd.toFixed(4)}</Text>
+          ) : null}
           {"   "}Votes: {JSON.stringify(snap.brain.votes)}
         </Text>
       </Box>

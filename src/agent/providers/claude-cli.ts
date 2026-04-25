@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { CONFIG } from "../../config.js";
+import { INTENT_JSON_SCHEMA } from "../schema.js";
 import type { Provider } from "./types.js";
 
 interface ClaudeCliResult {
@@ -7,6 +8,10 @@ interface ClaudeCliResult {
   subtype: string;
   is_error: boolean;
   result: string;
+  structured_output?: unknown;
+  total_cost_usd?: number;
+  duration_ms?: number;
+  num_turns?: number;
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -19,12 +24,18 @@ const SPAWN_TIMEOUT_MS = 90_000;
 
 /**
  * Drives the local `claude` CLI in non-interactive print mode.
- * Useful when you want to run on a Claude.ai subscription instead of an API key.
  *
- * Trade-offs vs OpenRouter:
- *   - Higher latency (process spawn + harness boot per call)
- *   - Each self-consistency sample = a separate subprocess
- *   - Auth comes from whatever `claude` is locally configured with
+ * Lockdown posture:
+ *   --bare                       no hooks/skills/MCP/CLAUDE.md auto-discovery
+ *   --no-session-persistence     leaves no junk session files behind
+ *   --permission-mode dontAsk    deny anything not in the allowlist
+ *   --allowedTools ""            empty allowlist → model has no tools
+ *   --json-schema <Intent>       harness-level structured output enforcement
+ *
+ * Billing: `--bare` skips OAuth and keychain reads, so this provider always
+ * runs against ANTHROPIC_API_KEY (Anthropic Console credits). Subscription
+ * (Pro/Max) auth is not supported by this path and not endorsed by Anthropic
+ * for automated agents. config.ts enforces ANTHROPIC_API_KEY at startup.
  */
 export const claudeCliProvider: Provider = async (
   _packet,
@@ -34,18 +45,24 @@ export const claudeCliProvider: Provider = async (
   const args = [
     "-p",
     "--bare",
-    "--tools",
-    "",
     "--no-session-persistence",
-    "--dangerously-skip-permissions",
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools",
+    "",
     "--output-format",
     "json",
+    "--json-schema",
+    JSON.stringify(INTENT_JSON_SCHEMA),
     "--system-prompt",
     systemPrompt,
     "--model",
     CONFIG.LLM_MODEL,
-    userMessage,
   ];
+  if (CONFIG.LLM_FALLBACK_MODEL) {
+    args.push("--fallback-model", CONFIG.LLM_FALLBACK_MODEL);
+  }
+  args.push(userMessage);
 
   const stdout = await new Promise<string>((resolve, reject) => {
     const child = spawn(CONFIG.CLAUDE_CLI_PATH, args, {
@@ -92,11 +109,19 @@ export const claudeCliProvider: Provider = async (
     throw new Error(`claude CLI error: ${parsed.result.slice(0, 300)}`);
   }
 
+  // Prefer the schema-validated structured output. Fall back to free-text
+  // result if the CLI didn't produce one (older versions, or schema reject).
+  const raw =
+    parsed.structured_output !== undefined
+      ? JSON.stringify(parsed.structured_output)
+      : parsed.result;
+
   return {
-    raw: parsed.result,
+    raw,
     usage: {
       prompt_tokens: parsed.usage?.input_tokens ?? 0,
       completion_tokens: parsed.usage?.output_tokens ?? 0,
     },
+    costUsd: parsed.total_cost_usd,
   };
 };

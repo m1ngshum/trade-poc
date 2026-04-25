@@ -9,6 +9,8 @@ export interface ProviderSample {
   /** Raw text returned by the provider — caller parses + Zod-validates. */
   raw: string;
   usage: ProviderUsage;
+  /** USD cost for this single call, when the provider reports it. */
+  costUsd?: number;
 }
 
 /**

@@ -37,13 +37,22 @@ See `.env.example`. Key knobs:
 
 **`openrouter` (default)** — calls OpenRouter's OpenAI-compatible endpoint with the configured API key. Native parallel calls, prompt caching, low per-call latency. `LLM_MODEL` uses OpenRouter's namespacing, e.g. `anthropic/claude-sonnet-4.6`.
 
-**`claude-cli`** — spawns the local `claude` CLI in non-interactive print mode (`claude -p --bare --output-format json`). Useful when you want to run on a Claude.ai Pro/Max subscription instead of an API key. `LLM_MODEL` uses Claude's own naming, e.g. `sonnet` or `claude-sonnet-4-6`.
+**`claude-cli`** — spawns the local `claude` CLI in non-interactive print mode with a hardened flag set:
 
-Trade-offs of `claude-cli`:
-- Each self-consistency sample spawns a separate subprocess (slower, ~3–8s per sample plus harness boot).
-- Auth follows whatever `claude` is locally signed into.
-- Subscription rate limits may bite at high `SELF_CONSISTENCY_N` × short `CYCLE_INTERVAL_MIN`. Start with `SELF_CONSISTENCY_N=1` to feel out the budget.
-- Tools are disabled (`--tools ""`) so the model can't accidentally do filesystem or web work — it's purely a chat completion.
+```
+claude -p --bare --no-session-persistence \
+  --permission-mode dontAsk --allowedTools "" \
+  --output-format json --json-schema <Intent JSON Schema> \
+  --system-prompt <SYSTEM_PROMPT> --model <LLM_MODEL>
+```
+
+`LLM_MODEL` uses the CLI's own naming (`sonnet`, `claude-sonnet-4-6`, etc). Set `LLM_FALLBACK_MODEL` to enable automatic failover when the primary is overloaded.
+
+**Billing — read this before running.** `--bare` skips OAuth and keychain reads, so this provider **always** bills against `ANTHROPIC_API_KEY` (Anthropic Console credits). Per Anthropic's [Agent SDK overview](https://platform.claude.com/docs/en/agent-sdk/overview), subscription (Pro/Max) auth is not supported for third-party agents. Set up Console auto-reload with a hard cap to avoid surprises. The dashboard surfaces `total_cost_usd` per cycle.
+
+Other trade-offs:
+- Each self-consistency sample spawns a separate subprocess (~3–8s per sample plus harness boot). Start with `SELF_CONSISTENCY_N=1` to gauge spend.
+- `--permission-mode dontAsk` + empty allowlist denies every tool the model might try; `--json-schema` enforces structured output at the harness layer (no prompt-following lottery).
 
 ## Architecture
 

@@ -51,3 +51,30 @@ export const IntentSchema = z.object({
 });
 
 export type Intent = z.infer<typeof IntentSchema>;
+
+/**
+ * Hand-mirrored JSON Schema for Intent, used by providers that support
+ * structured-output enforcement (e.g. `claude -p --json-schema`).
+ * Keep in sync with IntentSchema above.
+ */
+export const INTENT_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["BUY", "SELL", "HOLD", "CLOSE"] },
+    symbol: { type: "string" },
+    size_pct_of_equity: { type: "number", minimum: 0, maximum: 100 },
+    stop_loss_pct: { type: "number", minimum: 0 },
+    take_profit_pct: { type: "number", minimum: 0 },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    rationale: { type: "string" },
+  },
+  required: [
+    "action",
+    "symbol",
+    "size_pct_of_equity",
+    "stop_loss_pct",
+    "take_profit_pct",
+    "confidence",
+    "rationale",
+  ],
+} as const;
