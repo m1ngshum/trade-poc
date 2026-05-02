@@ -1,28 +1,32 @@
-import OpenAI from "openai";
-import type { ChatCompletionCreateParamsNonStreaming } from "openai/resources/chat/completions";
 import { CONFIG } from "../config.js";
 import { logger } from "../logger.js";
 import { buildUserMessage, SYSTEM_PROMPT } from "./prompt.js";
+import { claudeCliProvider } from "./providers/claude-cli.js";
+import { openrouterProvider } from "./providers/openrouter.js";
+import type { Provider } from "./providers/types.js";
 import { IntentSchema, type Intent, type MarketStatePacket } from "./schema.js";
 
-let _client: OpenAI | null = null;
-
-function client(): OpenAI {
-  if (_client) return _client;
-  _client = new OpenAI({
-    apiKey: CONFIG.OPENROUTER_API_KEY,
-    baseURL: "https://openrouter.ai/api/v1",
-    defaultHeaders: {
-      "HTTP-Referer": "https://github.com/m1ngshum/trade-poc",
-      "X-Title": "crypto-agent-cli",
-    },
-  });
-  return _client;
+function selectProvider(): Provider {
+  switch (CONFIG.LLM_PROVIDER) {
+    case "openrouter":
+      return openrouterProvider;
+    case "claude-cli":
+    case "claude-cli-oauth":
+      return claudeCliProvider;
+    default: {
+      const _exhaustive: never = CONFIG.LLM_PROVIDER;
+      throw new Error(`unknown provider: ${String(_exhaustive)}`);
+    }
+  }
 }
 
 export interface BrainResult {
   intent: Intent;
-  usage: { prompt_tokens: number; completion_tokens: number };
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    cost_usd?: number;
+  };
   samples: number;
   votes: Record<Intent["action"], number>;
 }
@@ -31,50 +35,41 @@ interface SampleResult {
   intent: Intent | null;
   prompt_tokens: number;
   completion_tokens: number;
+  cost_usd?: number;
   raw: string;
 }
 
+function extractJson(raw: string): string {
+  // Some models wrap JSON in ```json ... ``` despite the system prompt.
+  // Pull the first balanced object if present.
+  const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw);
+  if (fence?.[1]) return fence[1].trim();
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start >= 0 && end > start) return raw.slice(start, end + 1);
+  return raw;
+}
+
 async function sampleOnce(packet: MarketStatePacket): Promise<SampleResult> {
-  // OpenRouter forwards Anthropic `cache_control` hints to Claude models when
-  // the system message is sent as a content-block array. The OpenAI SDK's
-  // public types don't include cache_control, so we cast at the boundary.
-  const params = {
-    model: CONFIG.LLM_MODEL,
-    temperature: 0.3,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: [
-          {
-            type: "text",
-            text: SYSTEM_PROMPT,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
-      },
-      { role: "user", content: buildUserMessage(packet) },
-    ],
-  } as unknown as ChatCompletionCreateParamsNonStreaming;
+  const provider = selectProvider();
+  const result = await provider(packet, SYSTEM_PROMPT, buildUserMessage(packet));
 
-  const completion = await client().chat.completions.create(params);
-
-  const raw = completion.choices[0]?.message?.content ?? "";
   let parsed: Intent | null = null;
   try {
-    const json = JSON.parse(raw) as unknown;
-    const result = IntentSchema.safeParse(json);
-    if (result.success) parsed = result.data;
-    else logger.warn(`LLM sample failed schema: ${result.error.message}`);
+    const json = JSON.parse(extractJson(result.raw)) as unknown;
+    const validated = IntentSchema.safeParse(json);
+    if (validated.success) parsed = validated.data;
+    else logger.warn(`LLM sample failed schema: ${validated.error.message}`);
   } catch (e) {
     logger.warn(`LLM sample non-JSON: ${(e as Error).message}`);
   }
 
   return {
     intent: parsed,
-    prompt_tokens: completion.usage?.prompt_tokens ?? 0,
-    completion_tokens: completion.usage?.completion_tokens ?? 0,
-    raw,
+    prompt_tokens: result.usage.prompt_tokens,
+    completion_tokens: result.usage.completion_tokens,
+    cost_usd: result.costUsd,
+    raw: result.raw,
   };
 }
 
@@ -102,10 +97,14 @@ export async function decide(packet: MarketStatePacket): Promise<BrainResult> {
     else logger.warn(`LLM sample errored: ${(r.reason as Error)?.message}`);
   }
 
-  const usage = samples.reduce(
+  const usage = samples.reduce<BrainResult["usage"]>(
     (acc, s) => ({
       prompt_tokens: acc.prompt_tokens + s.prompt_tokens,
       completion_tokens: acc.completion_tokens + s.completion_tokens,
+      cost_usd:
+        s.cost_usd === undefined
+          ? acc.cost_usd
+          : (acc.cost_usd ?? 0) + s.cost_usd,
     }),
     { prompt_tokens: 0, completion_tokens: 0 },
   );
