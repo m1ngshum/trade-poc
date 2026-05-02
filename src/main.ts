@@ -7,7 +7,9 @@ import {
   timeframeMinutes,
 } from "./data/indicators.js";
 import { classifyRegime } from "./data/regime.js";
-import { decide } from "./agent/brain.js";
+import { decide, syntheticHold } from "./agent/brain.js";
+import { PROMPT_VERSION, systemPromptHash } from "./agent/prompt.js";
+import { CostTracker } from "./agent/cost-tracker.js";
 import type { MarketStatePacket } from "./agent/schema.js";
 import { evaluate } from "./risk/engine.js";
 import { PaperExchange } from "./exchange/paper.js";
@@ -23,8 +25,10 @@ import { bus, SNAPSHOT, type CycleSnapshot } from "./state.js";
 import { renderDashboard } from "./ui/dashboard.js";
 
 const exchange = new PaperExchange();
+const costTracker = new CostTracker(CONFIG.LLM_DAILY_BUDGET_USD);
 const tfMinutes = timeframeMinutes(CONFIG.TIMEFRAME);
 const cycleMs = CONFIG.CYCLE_INTERVAL_MIN * 60_000;
+const PROMPT_HASH = systemPromptHash();
 
 let halted = false;
 let cycleTimer: NodeJS.Timeout | null = null;
@@ -74,9 +78,22 @@ async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void>
   }
 
   const packet = buildPacket(symbol, candles, ticker);
-  const brain = await decide(packet);
+  const brain = costTracker.isExceeded()
+    ? syntheticHold(
+        symbol,
+        `LLM_BUDGET_EXCEEDED: spent=$${costTracker.getSpentToday().toFixed(4)} budget=$${costTracker.getBudgetUsd()}`,
+      )
+    : await decide(packet);
+  costTracker.add(brain.usage.cost_usd);
 
-  const id = decisionId(symbol, brain.intent.action, packet.timestamp);
+  const id = decisionId(
+    SNAPSHOT.cycleNumber,
+    symbol,
+    brain.intent.action,
+    brain.intent.stop_loss_pct,
+    brain.intent.take_profit_pct,
+    brain.intent.size_pct_of_equity,
+  );
   const duplicate = decisionExists(id);
 
   const risk = evaluate({
@@ -110,6 +127,11 @@ async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void>
     model: CONFIG.LLM_MODEL,
     prompt_tokens: brain.usage.prompt_tokens,
     completion_tokens: brain.usage.completion_tokens,
+    cycle_number: SNAPSHOT.cycleNumber,
+    prompt_version: PROMPT_VERSION,
+    system_prompt_hash: PROMPT_HASH,
+    raw_response: brain.raw_response,
+    cost_usd: brain.usage.cost_usd,
   };
   insertDecision(record);
 
@@ -126,6 +148,9 @@ async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void>
     equityAfter: exchange.getEquity(),
     trade: trade ?? exitTrade ?? null,
     recentTrades: exchange.getRecentTrades(5),
+    llmSpentTodayUsd: costTracker.getSpentToday(),
+    llmBudgetUsd: costTracker.getBudgetUsd(),
+    llmBudgetExceeded: costTracker.isExceeded(),
   };
   SNAPSHOT.lastCycle = snap;
   bus.emit("cycle", snap);

@@ -29,6 +29,10 @@ export interface BrainResult {
   };
   samples: number;
   votes: Record<Intent["action"], number>;
+  // Raw text of the winning sample (or the empty string for synthetic HOLDs).
+  // Journaled alongside the parsed Intent so an old decision can be replayed
+  // even after the prompt or schema changes.
+  raw_response: string;
 }
 
 interface SampleResult {
@@ -127,6 +131,7 @@ export async function decide(packet: MarketStatePacket): Promise<BrainResult> {
       usage,
       samples: samples.length,
       votes,
+      raw_response: samples.map((s) => s.raw).join("\n---\n"),
     };
   }
 
@@ -144,6 +149,7 @@ export async function decide(packet: MarketStatePacket): Promise<BrainResult> {
       usage,
       samples: samples.length,
       votes,
+      raw_response: samples.map((s) => s.raw).join("\n---\n"),
     };
   }
 
@@ -155,5 +161,19 @@ export async function decide(packet: MarketStatePacket): Promise<BrainResult> {
     usage,
     samples: samples.length,
     votes,
+    raw_response: winners[0]!.raw,
+  };
+}
+
+// Builds a synthetic HOLD result for callers that need to short-circuit the
+// LLM entirely (budget exceeded, halt latched, etc.) while still populating
+// a well-formed BrainResult for the journal and dashboard.
+export function syntheticHold(symbol: string, reason: string): BrainResult {
+  return {
+    intent: holdIntent(symbol, reason),
+    usage: { prompt_tokens: 0, completion_tokens: 0 },
+    samples: 0,
+    votes: { BUY: 0, SELL: 0, HOLD: 0, CLOSE: 0 },
+    raw_response: "",
   };
 }

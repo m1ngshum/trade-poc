@@ -19,6 +19,11 @@ export interface DecisionRecord {
   model: string;
   prompt_tokens: number;
   completion_tokens: number;
+  cycle_number?: number;
+  prompt_version?: string;
+  system_prompt_hash?: string;
+  raw_response?: string;
+  cost_usd?: number;
 }
 
 export interface DecisionRow {
@@ -34,6 +39,11 @@ export interface DecisionRow {
   model: string;
   prompt_tokens: number;
   completion_tokens: number;
+  cycle_number: number | null;
+  prompt_version: string | null;
+  system_prompt_hash: string | null;
+  raw_response: string | null;
+  cost_usd: number | null;
 }
 
 export interface TradeRow {
@@ -51,22 +61,54 @@ export interface TradeRow {
   closed_at: string | null;
 }
 
+/**
+ * Deterministic decision id. Includes the cycle number plus the intent
+ * fingerprint (symbol, action, stop, tp, size) so two cycles can never
+ * collide and a crash-restart that re-issues the same intent in the same
+ * cycle stays idempotent. The previous implementation hashed the wall-clock
+ * timestamp, which made collisions essentially impossible — defeating the
+ * point of dedupe entirely.
+ */
 export function decisionId(
+  cycleNumber: number,
   symbol: string,
   action: string,
-  timestamp: string,
+  stopLossPct: number,
+  takeProfitPct: number,
+  sizePctOfEquity: number,
 ): string {
   return createHash("sha256")
-    .update(`${symbol}|${action}|${timestamp}`)
+    .update(
+      [
+        cycleNumber,
+        symbol,
+        action,
+        stopLossPct,
+        takeProfitPct,
+        sizePctOfEquity,
+      ].join("|"),
+    )
     .digest("hex");
 }
 
 let _db: Database.Database | null = null;
+let _pathOverride: string | null = null;
+
+// Tests use this to point the journal at a temp file before the first call.
+// Resets to CONFIG.DB_PATH if called with `null`.
+export function setDbPathForTesting(path: string | null): void {
+  if (_db) {
+    _db.close();
+    _db = null;
+  }
+  _pathOverride = path;
+}
 
 function db(): Database.Database {
   if (_db) return _db;
-  mkdirSync(dirname(CONFIG.DB_PATH), { recursive: true });
-  _db = new Database(CONFIG.DB_PATH);
+  const path = _pathOverride ?? CONFIG.DB_PATH;
+  mkdirSync(dirname(path), { recursive: true });
+  _db = new Database(path);
   _db.pragma("journal_mode = WAL");
   _db.exec(`
     CREATE TABLE IF NOT EXISTS decisions (
@@ -101,6 +143,29 @@ function db(): Database.Database {
     );
     CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_at);
   `);
+
+  // Migrate existing journals to add columns introduced after v0.1. SQLite
+  // doesn't support `ADD COLUMN IF NOT EXISTS`, so we probe table_info first.
+  const existingCols = new Set(
+    (
+      _db.prepare("PRAGMA table_info(decisions)").all() as Array<{
+        name: string;
+      }>
+    ).map((r) => r.name),
+  );
+  const newCols: Array<[string, string]> = [
+    ["cycle_number", "INTEGER"],
+    ["prompt_version", "TEXT"],
+    ["system_prompt_hash", "TEXT"],
+    ["raw_response", "TEXT"],
+    ["cost_usd", "REAL"],
+  ];
+  for (const [name, type] of newCols) {
+    if (!existingCols.has(name)) {
+      _db.exec(`ALTER TABLE decisions ADD COLUMN ${name} ${type}`);
+    }
+  }
+
   return _db;
 }
 
@@ -108,10 +173,12 @@ export function insertDecision(rec: DecisionRecord): void {
   const stmt = db().prepare(`
     INSERT OR IGNORE INTO decisions
       (id, timestamp, symbol, market_state, intent, risk_verdict,
-       reject_reason, fill_price, equity_after, model, prompt_tokens, completion_tokens)
+       reject_reason, fill_price, equity_after, model, prompt_tokens, completion_tokens,
+       cycle_number, prompt_version, system_prompt_hash, raw_response, cost_usd)
     VALUES
       (@id, @timestamp, @symbol, @market_state, @intent, @risk_verdict,
-       @reject_reason, @fill_price, @equity_after, @model, @prompt_tokens, @completion_tokens)
+       @reject_reason, @fill_price, @equity_after, @model, @prompt_tokens, @completion_tokens,
+       @cycle_number, @prompt_version, @system_prompt_hash, @raw_response, @cost_usd)
   `);
   stmt.run({
     id: rec.id,
@@ -126,6 +193,11 @@ export function insertDecision(rec: DecisionRecord): void {
     model: rec.model,
     prompt_tokens: rec.prompt_tokens,
     completion_tokens: rec.completion_tokens,
+    cycle_number: rec.cycle_number ?? null,
+    prompt_version: rec.prompt_version ?? null,
+    system_prompt_hash: rec.system_prompt_hash ?? null,
+    raw_response: rec.raw_response ?? null,
+    cost_usd: rec.cost_usd ?? null,
   });
 }
 

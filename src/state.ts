@@ -17,6 +17,9 @@ export interface CycleSnapshot {
   equityAfter: number;
   trade: Trade | null;
   recentTrades: Trade[];
+  llmSpentTodayUsd: number;
+  llmBudgetUsd: number;
+  llmBudgetExceeded: boolean;
 }
 
 export interface Snapshot {

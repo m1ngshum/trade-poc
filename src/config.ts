@@ -30,6 +30,8 @@ const ConfigSchema = z
     MAX_POSITION_PCT: z.coerce.number().positive().max(100).default(20),
     DAILY_LOSS_LIMIT_PCT: z.coerce.number().positive().default(3),
     MAX_DRAWDOWN_PCT: z.coerce.number().positive().default(15),
+    MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.6),
+    LLM_DAILY_BUDGET_USD: z.coerce.number().nonnegative().default(5),
 
     LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
     DB_PATH: z.string().default("./data/journal.db"),

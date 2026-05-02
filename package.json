@@ -9,6 +9,7 @@
     "start": "node dist/main.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "OPENROUTER_API_KEY=test tsx --test tests/*.test.ts",
     "journal": "tsx src/scripts/print-journal.ts",
     "stats": "tsx src/scripts/stats.ts"
   },
