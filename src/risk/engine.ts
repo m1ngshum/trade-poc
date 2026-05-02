@@ -42,9 +42,12 @@ export function evaluate({
     return { verdict: "REJECT", reason: `SYMBOL_NOT_WHITELISTED: ${i.symbol}`, intent: i };
   }
 
-  // 3. Max drawdown kill — checked before HOLD short-circuit so we halt
-  //    the loop even when the model is sitting tight.
-  const drawdownLimit = CONFIG.INITIAL_EQUITY * (1 - CONFIG.MAX_DRAWDOWN_PCT / 100);
+  // 3. Max drawdown kill — anchored to the equity high-water mark, NOT
+  //    INITIAL_EQUITY. Otherwise a doubled-up account could give back 50%
+  //    of peak before tripping the 15% line. Checked before HOLD so we
+  //    halt even on neutral cycles.
+  const drawdownLimit =
+    packet.equity_high_water * (1 - CONFIG.MAX_DRAWDOWN_PCT / 100);
   if (packet.equity_usd < drawdownLimit) {
     return { verdict: "HALT", reason: "MAX_DRAWDOWN", intent: i };
   }
@@ -70,26 +73,25 @@ export function evaluate({
     };
   }
 
-  // 7. Size cap
-  if (i.size_pct_of_equity > CONFIG.MAX_POSITION_PCT) {
+  // 7. Stop-loss must be present and not absurdly tight. Anything below
+  //    0.1% would force the sizing override (step 11) to >100% of equity.
+  if (i.stop_loss_pct <= 0) {
+    return { verdict: "REJECT", reason: "STOP_LOSS_MISSING", intent: i };
+  }
+  if (i.stop_loss_pct < 0.1) {
     return {
       verdict: "REJECT",
-      reason: `SIZE_CAP: ${i.size_pct_of_equity}% > ${CONFIG.MAX_POSITION_PCT}%`,
+      reason: `STOP_TOO_TIGHT: ${i.stop_loss_pct}% < 0.1%`,
       intent: i,
     };
   }
 
-  // 8. Stop-loss present
-  if (i.stop_loss_pct <= 0) {
-    return { verdict: "REJECT", reason: "STOP_LOSS_MISSING", intent: i };
-  }
-
-  // 9. Duplicate order
+  // 8. Duplicate order
   if (duplicateOrderId) {
     return { verdict: "REJECT", reason: "DUPLICATE_ORDER", intent: i };
   }
 
-  // 10. No double position — only CLOSE is allowed when something is open.
+  // 9. No double position — only CLOSE is allowed when something is open.
   if (
     packet.open_position.side !== "none" &&
     (i.action === "BUY" || i.action === "SELL")
@@ -97,9 +99,21 @@ export function evaluate({
     return { verdict: "REJECT", reason: "POSITION_ALREADY_OPEN", intent: i };
   }
 
-  // 11. CLOSE with no open position is a no-op error — soft reject.
+  // 10. CLOSE with no open position is a no-op error — soft reject.
   if (i.action === "CLOSE" && packet.open_position.side === "none") {
     return { verdict: "REJECT", reason: "CLOSE_WITHOUT_POSITION", intent: i };
+  }
+
+  // 11. Risk-based sizing override — the LLM proposes a direction; the
+  //     engine sizes it. Risk-per-trade as a fraction of equity divided by
+  //     the stop distance, capped by MAX_POSITION_PCT. The model's proposed
+  //     size_pct is overridden so a low-confidence stop-tight intent can't
+  //     stake the same notional as a high-conviction wide-stop one.
+  //     CLOSE keeps the LLM's size (zero) since it just exits the position.
+  if (i.action === "BUY" || i.action === "SELL") {
+    const riskBasedPct = (CONFIG.RISK_PER_TRADE_PCT / i.stop_loss_pct) * 100;
+    const sized = Math.min(riskBasedPct, CONFIG.MAX_POSITION_PCT);
+    return { verdict: "ACCEPT", intent: { ...i, size_pct_of_equity: sized } };
   }
 
   return { verdict: "ACCEPT", intent: i };

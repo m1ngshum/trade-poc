@@ -25,6 +25,7 @@ function packet(overrides: Partial<MarketStatePacket> = {}): MarketStatePacket {
     regime: "ranging",
     open_position: { side: "none", entry_price: 0, unrealized_pnl_pct: 0 },
     equity_usd: 10_000,
+    equity_high_water: 10_000,
     daily_pnl_pct: 0,
     last_3_trades: [],
     ...overrides,
@@ -112,13 +113,25 @@ test("confidence at boundary (>= MIN_CONFIDENCE) passes", () => {
   assert.equal(r.verdict, "ACCEPT");
 });
 
-test("size above MAX_POSITION_PCT → SIZE_CAP", () => {
+test("LLM-proposed size is overridden by risk-based sizing (regression for C3)", () => {
+  // RISK_PER_TRADE_PCT default 0.5, stop_loss_pct=2 → 0.5/2*100 = 25 → clamped
+  // to MAX_POSITION_PCT (default 20). The LLM's proposed 7 is ignored.
   const r = evaluate({
-    intent: intent({ size_pct_of_equity: 25 }),
+    intent: intent({ size_pct_of_equity: 7, stop_loss_pct: 2 }),
     packet: packet(),
   });
-  assert.equal(r.verdict, "REJECT");
-  assert.match(r.reason ?? "", /SIZE_CAP/);
+  assert.equal(r.verdict, "ACCEPT");
+  assert.equal(r.intent?.size_pct_of_equity, 20);
+});
+
+test("wider stop produces a smaller risk-based size", () => {
+  // 0.5 / 10 * 100 = 5%
+  const r = evaluate({
+    intent: intent({ size_pct_of_equity: 99, stop_loss_pct: 10 }),
+    packet: packet(),
+  });
+  assert.equal(r.verdict, "ACCEPT");
+  assert.ok(Math.abs((r.intent?.size_pct_of_equity ?? 0) - 5) < 1e-9);
 });
 
 test("missing stop-loss → STOP_LOSS_MISSING", () => {
@@ -187,4 +200,33 @@ test("valid CLOSE of an open long → ACCEPT", () => {
     }),
   });
   assert.equal(r.verdict, "ACCEPT");
+});
+
+test("drawdown HALT is anchored to high-water mark, not initial equity (regression for C6)", () => {
+  // HWM=20000, MAX_DD=15% → kill line = 17000. Equity 18000 sits above the
+  // line under HWM anchoring; under the old INITIAL_EQUITY=10000 anchor it
+  // would not have halted either, so the discriminating case is below.
+  const r1 = evaluate({
+    intent: intent({ action: "HOLD", size_pct_of_equity: 0 }),
+    packet: packet({ equity_usd: 18_000, equity_high_water: 20_000 }),
+  });
+  assert.equal(r1.verdict, "ACCEPT");
+
+  // Equity 16000 is well above the old INITIAL_EQUITY-anchored line (8500)
+  // but BELOW the HWM-anchored line (17000) → must HALT.
+  const r2 = evaluate({
+    intent: intent({ action: "HOLD", size_pct_of_equity: 0 }),
+    packet: packet({ equity_usd: 16_000, equity_high_water: 20_000 }),
+  });
+  assert.equal(r2.verdict, "HALT");
+  assert.equal(r2.reason, "MAX_DRAWDOWN");
+});
+
+test("stop tighter than 0.1% is rejected (would force >100% sizing)", () => {
+  const r = evaluate({
+    intent: intent({ stop_loss_pct: 0.05 }),
+    packet: packet(),
+  });
+  assert.equal(r.verdict, "REJECT");
+  assert.match(r.reason ?? "", /STOP_TOO_TIGHT/);
 });

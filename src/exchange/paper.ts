@@ -1,10 +1,17 @@
 import { CONFIG } from "../config.js";
+import { logger } from "../logger.js";
 import type { Intent } from "../agent/schema.js";
 
 // Binance spot taker is 10 bps standard, 7.5 bps with BNB discount. We model
 // the standard rate; tests can override via the constructor. Anything lower
 // silently flatters backtest results vs live.
 export const TAKER_FEE = 0.001; // 0.1%
+
+export interface Bar {
+  high: number;
+  low: number;
+  close: number;
+}
 
 export interface Position {
   symbol: string;
@@ -58,6 +65,11 @@ function utcDateKey(d: Date): string {
 
 export class PaperExchange {
   private equity: number;
+  // High-water mark of equity since the process started. Drives the
+  // max-drawdown kill switch — anchoring the kill line to peak equity (not
+  // INITIAL_EQUITY) so a $20k account can't bleed back to $8.5k and call it
+  // "still within the 15% allowance". Reset each launch (no persistence).
+  private highWater: number;
   private positions: Map<string, Position> = new Map();
   private history: Trade[] = [];
   private dayStartEquity: number;
@@ -73,8 +85,13 @@ export class PaperExchange {
     private readonly now: () => Date = () => new Date(),
   ) {
     this.equity = initialEquity;
+    this.highWater = initialEquity;
     this.dayStartEquity = initialEquity;
     this.currentDay = utcDateKey(this.now());
+  }
+
+  private bumpHighWater(): void {
+    if (this.equity > this.highWater) this.highWater = this.equity;
   }
 
   private rolloverIfNewDay(): void {
@@ -100,6 +117,10 @@ export class PaperExchange {
   getEquity(): number {
     this.rolloverIfNewDay();
     return this.equity;
+  }
+
+  getHighWater(): number {
+    return this.highWater;
   }
 
   getDailyPnlPct(): number {
@@ -188,6 +209,7 @@ export class PaperExchange {
     const qty = midPrice > 0 ? sizeUsd / midPrice : 0;
 
     this.equity -= fee;
+    this.bumpHighWater();
 
     const pos: Position = {
       symbol: intent.symbol,
@@ -214,19 +236,60 @@ export class PaperExchange {
   }
 
   /**
-   * Check the open position against stop-loss / take-profit using the latest
-   * mid price; if either is breached, close it. Used between LLM cycles to
-   * give SL/TP execution semantics without a separate order book.
+   * Models stop-loss / take-profit as resting orders that fire intra-bar:
+   * triggered when the bar's high/low reaches the stop or TP level, filled
+   * at the trigger price (optimistic — gap-through slippage is not modeled
+   * in v0.1). The previous mid-only check missed wicks that hit the stop
+   * and recovered, which silently inflated paper PnL vs live.
+   *
+   * When both stop and TP fall inside the same bar, the stop wins
+   * (conservative — without tick-level data we can't know which fired
+   * first, so we assume the worse outcome).
    */
-  checkExits(symbol: string, lastPrice: number, decisionId?: string): Trade | null {
+  checkExits(symbol: string, bar: Bar, decisionId?: string): Trade | null {
     const pos = this.positions.get(symbol);
     if (!pos) return null;
-    const direction = pos.side === "long" ? 1 : -1;
-    const movePct = ((lastPrice - pos.entryPrice) / pos.entryPrice) * 100 * direction;
-    if (movePct <= -pos.stopLossPct || movePct >= pos.takeProfitPct) {
-      return this.closePosition(pos, lastPrice, decisionId);
-    }
+    if (!(bar.low <= bar.high)) return null;
+
+    const stopPrice =
+      pos.side === "long"
+        ? pos.entryPrice * (1 - pos.stopLossPct / 100)
+        : pos.entryPrice * (1 + pos.stopLossPct / 100);
+    const tpPrice =
+      pos.side === "long"
+        ? pos.entryPrice * (1 + pos.takeProfitPct / 100)
+        : pos.entryPrice * (1 - pos.takeProfitPct / 100);
+
+    const stopHit =
+      pos.side === "long" ? bar.low <= stopPrice : bar.high >= stopPrice;
+    const tpHit =
+      pos.side === "long" ? bar.high >= tpPrice : bar.low <= tpPrice;
+
+    if (stopHit) return this.closePosition(pos, stopPrice, decisionId);
+    if (tpHit) return this.closePosition(pos, tpPrice, decisionId);
     return null;
+  }
+
+  /**
+   * Force-close every open position at the supplied last price. Used by the
+   * HALT path so a max-drawdown breach can't leave a position bleeding
+   * unattended. Falls back to entry price (zero realised PnL beyond fees)
+   * when a price is missing — that case is logged and should never happen
+   * in normal operation.
+   */
+  closeAll(lastPrices: Map<string, number>, closeDecisionId?: string): Trade[] {
+    const trades: Trade[] = [];
+    for (const pos of Array.from(this.positions.values())) {
+      let exit = lastPrices.get(pos.symbol);
+      if (exit === undefined || !Number.isFinite(exit)) {
+        logger.warn(
+          `closeAll: no price for ${pos.symbol}, closing at entry ${pos.entryPrice}`,
+        );
+        exit = pos.entryPrice;
+      }
+      trades.push(this.closePosition(pos, exit, closeDecisionId));
+    }
+    return trades;
   }
 
   private closePosition(
@@ -241,6 +304,7 @@ export class PaperExchange {
     const netPnlUsd = grossPnlUsd - fee;
 
     this.equity += netPnlUsd;
+    this.bumpHighWater();
 
     // Attribute sizePct against entry-time equity (pre-fee), not the
     // post-fill equity. Otherwise a position that lost half its value would

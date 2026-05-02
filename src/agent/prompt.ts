@@ -21,9 +21,9 @@ The Intent schema is:
 
 Rules:
 - HOLD is always valid. Never force a trade.
-- size_pct_of_equity must be between 1 and 20.
-- stop_loss_pct must be between 0.5 and 5.
-- If confidence < 0.6, return HOLD.
+- size_pct_of_equity is ADVISORY — the risk engine resizes every accepted trade to risk RISK_PER_TRADE_PCT of equity per stop, capped at MAX_POSITION_PCT. Pick something in 1-20 anyway; it shows your conviction.
+- stop_loss_pct must be between 0.5 and 5. The engine rejects stops tighter than 0.1.
+- If confidence < 0.6, return HOLD. (The engine also enforces this for non-HOLD intents.)
 - If open_position.side != "none" and action = "BUY" or "SELL", return HOLD instead (use CLOSE to exit, then re-enter on a later cycle).
 - If you would BUY but already long, or SELL but already short, return HOLD.
 - Output JSON only.`;

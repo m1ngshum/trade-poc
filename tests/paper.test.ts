@@ -69,30 +69,63 @@ test("feePaidUsd reflects notional, not |PnL| (regression)", () => {
   assert.equal(lost.feePaidUsd, 2);
 });
 
-test("checkExits triggers on stop-loss breach", () => {
+test("checkExits triggers on intra-bar stop wick (regression for C2)", () => {
   const ex = new PaperExchange(10_000);
   ex.fill(buy({ stop_loss_pct: 1 }), 100, "open");
-  // 1% adverse from 100 long is 99.
-  const exit = ex.checkExits("BTC/USDT", 98.5);
+  // entry=100, stopPrice=99. Bar wicks to 98.5 then closes back at 99.5.
+  // The previous mid-only checkExits would have missed this entirely.
+  const exit = ex.checkExits("BTC/USDT", { high: 100, low: 98.5, close: 99.5 });
   assert.ok(exit !== null);
-  assert.equal(exit?.exitPrice, 98.5);
+  // Fill is at the trigger price (99), not at the wick low (98.5).
+  assert.ok(Math.abs((exit?.exitPrice ?? 0) - 99) < 1e-9);
   assert.ok(exit!.pnlUsd < 0);
 });
 
-test("checkExits triggers on take-profit breach", () => {
+test("checkExits triggers on intra-bar take-profit reach", () => {
   const ex = new PaperExchange(10_000);
-  ex.fill(buy({ take_profit_pct: 2 }), 100, "open");
-  const exit = ex.checkExits("BTC/USDT", 102.5);
+  ex.fill(buy({ stop_loss_pct: 5, take_profit_pct: 2 }), 100, "open");
+  // entry=100, tpPrice=102. Bar wicks to 103 then closes back at 101.5.
+  const exit = ex.checkExits("BTC/USDT", { high: 103, low: 99, close: 101.5 });
   assert.ok(exit !== null);
-  assert.equal(exit?.exitPrice, 102.5);
+  assert.ok(Math.abs((exit?.exitPrice ?? 0) - 102) < 1e-9);
   assert.ok(exit!.pnlUsd > 0);
 });
 
 test("checkExits returns null inside the corridor", () => {
   const ex = new PaperExchange(10_000);
   ex.fill(buy({ stop_loss_pct: 1, take_profit_pct: 2 }), 100, "open");
-  const exit = ex.checkExits("BTC/USDT", 100.5);
+  const exit = ex.checkExits("BTC/USDT", { high: 100.8, low: 99.5, close: 100.5 });
   assert.equal(exit, null);
+});
+
+test("when stop and TP both fall inside the same bar, stop wins (conservative)", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(buy({ stop_loss_pct: 1, take_profit_pct: 1 }), 100, "open");
+  // bar engulfs both stop (99) and TP (101)
+  const exit = ex.checkExits("BTC/USDT", { high: 102, low: 98, close: 101 });
+  assert.ok(exit !== null);
+  assert.ok(Math.abs((exit?.exitPrice ?? 0) - 99) < 1e-9);
+});
+
+test("short stop fires when bar.high >= stopPrice", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(
+    {
+      action: "SELL",
+      symbol: "BTC/USDT",
+      size_pct_of_equity: 20,
+      stop_loss_pct: 1,
+      take_profit_pct: 5,
+      confidence: 0.9,
+      rationale: "test",
+    },
+    100,
+    "open",
+  );
+  // entry=100 short, stopPrice=101. Bar wicks to 102 then back.
+  const exit = ex.checkExits("BTC/USDT", { high: 102, low: 99, close: 101.5 });
+  assert.ok(exit !== null);
+  assert.ok(Math.abs((exit?.exitPrice ?? 0) - 101) < 1e-9);
 });
 
 test("daily rollover records yesterday before zeroing (regression for H16)", () => {
@@ -126,4 +159,46 @@ test("sizePct on closed trade uses entry-time equity (regression for H17)", () =
 
 test("default taker fee is 10 bps (regression for C5)", () => {
   assert.equal(TAKER_FEE, 0.001);
+});
+
+test("getHighWater rises with equity but does not fall when equity drops (regression for C6)", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(buy({ stop_loss_pct: 5, take_profit_pct: 50 }), 100, "open-1");
+  // TP at 150 (low 105 stays clear of stop at 95)
+  ex.checkExits("BTC/USDT", { high: 200, low: 105, close: 150 });
+  const peak = ex.getEquity();
+  assert.ok(peak > 10_000);
+  assert.equal(ex.getHighWater(), peak);
+
+  // New trade is stopped out → equity drops, HWM stays at peak.
+  ex.fill(buy({ stop_loss_pct: 5, take_profit_pct: 100 }), 200, "open-2");
+  ex.checkExits("BTC/USDT", { high: 201, low: 189, close: 195 });
+  assert.ok(ex.getEquity() < peak);
+  assert.equal(ex.getHighWater(), peak);
+});
+
+test("closeAll closes every open position at the supplied price (regression for C7)", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(buy({ symbol: "BTC/USDT" }), 100, "open-btc");
+  ex.fill(buy({ symbol: "ETH/USDT" }), 50, "open-eth");
+  const trades = ex.closeAll(
+    new Map([
+      ["BTC/USDT", 110],
+      ["ETH/USDT", 55],
+    ]),
+    "force-close",
+  );
+  assert.equal(trades.length, 2);
+  const btc = trades.find((t) => t.symbol === "BTC/USDT");
+  const eth = trades.find((t) => t.symbol === "ETH/USDT");
+  assert.equal(btc?.exitPrice, 110);
+  assert.equal(eth?.exitPrice, 55);
+});
+
+test("closeAll falls back to entry price when a symbol is missing", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(buy(), 100, "open");
+  const trades = ex.closeAll(new Map());
+  assert.equal(trades.length, 1);
+  assert.equal(trades[0]?.exitPrice, 100);
 });

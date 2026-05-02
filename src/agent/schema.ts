@@ -39,6 +39,7 @@ export const MarketStatePacketSchema = z
     regime: RegimeSchema,
     open_position: OpenPositionSchema,
     equity_usd: z.number(),
+    equity_high_water: z.number(),
     daily_pnl_pct: z.number(),
     last_3_trades: z.array(Last3TradeSchema),
   })
