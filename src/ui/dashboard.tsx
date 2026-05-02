@@ -154,6 +154,18 @@ const App: React.FC<DashboardProps> = ({ onForceCycle, onQuit }) => {
           ) : null}
           {"   "}Votes: {JSON.stringify(snap.brain.votes)}
         </Text>
+        <Text>
+          {"  "}Today's LLM spend: $
+          {snap.llmSpentTodayUsd.toFixed(4)}
+          {snap.llmBudgetUsd > 0 ? (
+            <Text> / ${snap.llmBudgetUsd.toFixed(2)} budget</Text>
+          ) : (
+            <Text dimColor> (no daily cap)</Text>
+          )}
+          {snap.llmBudgetExceeded ? (
+            <Text color="red"> · BUDGET EXCEEDED — synthesizing HOLDs</Text>
+          ) : null}
+        </Text>
       </Box>
 
       <Box marginTop={1} flexDirection="column">

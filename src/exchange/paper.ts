@@ -1,7 +1,10 @@
 import { CONFIG } from "../config.js";
 import type { Intent } from "../agent/schema.js";
 
-const TAKER_FEE = 0.0005; // 0.05%
+// Binance spot taker is 10 bps standard, 7.5 bps with BNB discount. We model
+// the standard rate; tests can override via the constructor. Anything lower
+// silently flatters backtest results vs live.
+export const TAKER_FEE = 0.001; // 0.1%
 
 export interface Position {
   symbol: string;
@@ -13,6 +16,16 @@ export interface Position {
   takeProfitPct: number;
   openedAt: string;
   openDecisionId?: string;
+  // Equity snapshot at the moment this position was opened, before fees were
+  // deducted. Used to attribute sizePct on the closed-trade row to entry-time
+  // equity rather than the (drifting) post-fee equity.
+  equityAtOpen: number;
+}
+
+export interface DailyPnlSnapshot {
+  day: string;
+  equityStart: number;
+  equityEnd: number;
 }
 
 export interface Trade {
@@ -39,7 +52,7 @@ export interface FillResult {
   feePaidUsd: number;
 }
 
-function utcDateKey(d: Date = new Date()): string {
+function utcDateKey(d: Date): string {
   return d.toISOString().slice(0, 10); // YYYY-MM-DD UTC
 }
 
@@ -49,19 +62,39 @@ export class PaperExchange {
   private history: Trade[] = [];
   private dayStartEquity: number;
   private currentDay: string;
+  // Records each completed UTC day's start/end equity so the dashboard or
+  // an external auditor can reconstruct daily PnL even after rollover. Kept
+  // in-memory only; the SQLite journal can derive the same series from the
+  // equity_after column of the decisions table if persistence is needed.
+  private dailyPnlHistory: DailyPnlSnapshot[] = [];
 
-  constructor(initialEquity: number = CONFIG.INITIAL_EQUITY) {
+  constructor(
+    initialEquity: number = CONFIG.INITIAL_EQUITY,
+    private readonly now: () => Date = () => new Date(),
+  ) {
     this.equity = initialEquity;
     this.dayStartEquity = initialEquity;
-    this.currentDay = utcDateKey();
+    this.currentDay = utcDateKey(this.now());
   }
 
   private rolloverIfNewDay(): void {
-    const today = utcDateKey();
+    const today = utcDateKey(this.now());
     if (today !== this.currentDay) {
+      // Capture yesterday's day before zeroing — otherwise a fill at
+      // 23:59:59 UTC followed by a read at 00:00:01 UTC would silently
+      // collapse the day's realised PnL.
+      this.dailyPnlHistory.push({
+        day: this.currentDay,
+        equityStart: this.dayStartEquity,
+        equityEnd: this.equity,
+      });
       this.currentDay = today;
       this.dayStartEquity = this.equity;
     }
+  }
+
+  getDailyPnlHistory(): readonly DailyPnlSnapshot[] {
+    return this.dailyPnlHistory;
   }
 
   getEquity(): number {
@@ -139,13 +172,18 @@ export class PaperExchange {
         position: null,
         trade,
         equityAfter: this.equity,
-        feePaidUsd: trade.pnlUsd < 0 ? -trade.pnlUsd * TAKER_FEE : trade.pnlUsd * TAKER_FEE,
+        // Fees are charged on notional, not on |PnL|. The previous
+        // implementation reported |pnlUsd| * fee which made small wins look
+        // like they paid trivial fees and large losses look extortionate.
+        feePaidUsd: pos.sizeUsd * TAKER_FEE,
       };
     }
 
-    // BUY or SELL — open a new position.
+    // BUY or SELL — open a new position. Snapshot equity *before* the fee is
+    // deducted so the closed-trade row attributes risk to entry-time equity.
+    const equityAtOpen = this.equity;
     const side: "long" | "short" = intent.action === "BUY" ? "long" : "short";
-    const sizeUsd = (intent.size_pct_of_equity / 100) * this.equity;
+    const sizeUsd = (intent.size_pct_of_equity / 100) * equityAtOpen;
     const fee = sizeUsd * TAKER_FEE;
     const qty = midPrice > 0 ? sizeUsd / midPrice : 0;
 
@@ -159,8 +197,9 @@ export class PaperExchange {
       qty,
       stopLossPct: intent.stop_loss_pct,
       takeProfitPct: intent.take_profit_pct,
-      openedAt: new Date().toISOString(),
+      openedAt: this.now().toISOString(),
       openDecisionId: decisionId,
+      equityAtOpen,
     };
     this.positions.set(intent.symbol, pos);
 
@@ -203,17 +242,23 @@ export class PaperExchange {
 
     this.equity += netPnlUsd;
 
+    // Attribute sizePct against entry-time equity (pre-fee), not the
+    // post-fill equity. Otherwise a position that lost half its value would
+    // record a sizePct higher than what was actually risked at open.
+    const sizePctAtEntry =
+      pos.equityAtOpen > 0 ? (pos.sizeUsd / pos.equityAtOpen) * 100 : 0;
+    const closedAt = this.now().toISOString();
     const trade: Trade = {
-      id: `${pos.symbol}-${pos.openedAt}-${new Date().toISOString()}`,
+      id: `${pos.symbol}-${pos.openedAt}-${closedAt}`,
       symbol: pos.symbol,
       side: pos.side,
       entryPrice: pos.entryPrice,
       exitPrice,
-      sizePct: pos.sizeUsd / (this.equity > 0 ? this.equity : 1) * 100,
+      sizePct: sizePctAtEntry,
       pnlPct,
       pnlUsd: netPnlUsd,
       openedAt: pos.openedAt,
-      closedAt: new Date().toISOString(),
+      closedAt,
       openDecisionId: pos.openDecisionId,
       closeDecisionId,
     };

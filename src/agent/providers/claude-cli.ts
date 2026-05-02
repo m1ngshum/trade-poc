@@ -29,6 +29,7 @@ const SPAWN_TIMEOUT_MS = 90_000;
  *   --no-session-persistence     leaves no junk session files behind
  *   --permission-mode dontAsk    deny anything not in the allowlist
  *   --allowedTools ""            empty allowlist → model has no tools
+ *   --max-turns 1                model gets one shot, no agentic looping
  *   --json-schema <Intent>       harness-level structured output enforcement
  *
  * Billing modes (CONFIG.LLM_PROVIDER):
@@ -57,6 +58,8 @@ export const claudeCliProvider: Provider = async (
     "dontAsk",
     "--allowedTools",
     "",
+    "--max-turns",
+    "1",
     "--output-format",
     "json",
     "--json-schema",

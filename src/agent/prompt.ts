@@ -1,4 +1,10 @@
+import { createHash } from "node:crypto";
 import type { MarketStatePacket } from "./schema.js";
+
+// Bump on every meaningful edit to SYSTEM_PROMPT or buildUserMessage. Stored
+// alongside each decision so a regression in win-rate can be correlated with
+// a prompt change.
+export const PROMPT_VERSION = "v1";
 
 export const SYSTEM_PROMPT = `You are a crypto trading analyst. You will receive a MarketStatePacket and must respond with ONLY a valid JSON object matching the Intent schema. No preamble. No markdown. No explanation outside the rationale field.
 
@@ -27,4 +33,8 @@ export function buildUserMessage(packet: MarketStatePacket): string {
 ${JSON.stringify(packet)}
 
 Respond with your Intent JSON now.`;
+}
+
+export function systemPromptHash(): string {
+  return createHash("sha256").update(SYSTEM_PROMPT).digest("hex").slice(0, 16);
 }
