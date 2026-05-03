@@ -57,7 +57,7 @@ export const IntentSchema = z
     stop_loss_pct: z.number().min(0),
     take_profit_pct: z.number().min(0),
     confidence: z.number().min(0).max(1),
-    rationale: z.string(),
+    rationale: z.string().max(500),
   })
   .strict();
 
@@ -77,7 +77,7 @@ export const INTENT_JSON_SCHEMA = {
     stop_loss_pct: { type: "number", minimum: 0 },
     take_profit_pct: { type: "number", minimum: 0 },
     confidence: { type: "number", minimum: 0, maximum: 1 },
-    rationale: { type: "string" },
+    rationale: { type: "string", maxLength: 500 },
   },
   required: [
     "action",

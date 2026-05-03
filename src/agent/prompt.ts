@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { MarketStatePacket } from "./schema.js";
+import { sanitizePacketStrings } from "./sanitize.js";
 
 // Bump on every meaningful edit to SYSTEM_PROMPT or buildUserMessage. Stored
 // alongside each decision so a regression in win-rate can be correlated with
@@ -29,8 +30,9 @@ Rules:
 - Output JSON only.`;
 
 export function buildUserMessage(packet: MarketStatePacket): string {
+  const safe = sanitizePacketStrings(packet);
   return `Current market state:
-${JSON.stringify(packet)}
+${JSON.stringify(safe)}
 
 Respond with your Intent JSON now.`;
 }
