@@ -144,6 +144,45 @@ export class PaperExchange {
     return ((this.equity - this.dayStartEquity) / this.dayStartEquity) * 100;
   }
 
+  /**
+   * E2: realised equity + unrealised P&L on every open position. Drives the
+   * daily-loss limit and max-DD halt so a position that grinds down without
+   * touching its stop still trips the kill switch — otherwise `equity_usd`
+   * lags reality by an entire bleed cycle.
+   *
+   * Falls back to entry price (zero unrealised) when a position has no
+   * `lastPrice` in the supplied map and logs a warning. In normal operation
+   * the cycle that calls this always has a fresh ticker for the symbol.
+   */
+  markToMarket(lastPrices: Map<string, number>): number {
+    this.rolloverIfNewDay();
+    let mtm = this.equity;
+    for (const pos of this.positions.values()) {
+      const px = lastPrices.get(pos.symbol);
+      if (px === undefined || !Number.isFinite(px)) {
+        logger.warn(
+          `markToMarket: no lastPrice for ${pos.symbol}; using entry (unrealised=0)`,
+        );
+        continue;
+      }
+      const dir = pos.side === "long" ? 1 : -1;
+      const movePct = ((px - pos.entryPrice) / pos.entryPrice) * dir;
+      mtm += movePct * pos.sizeUsd;
+    }
+    return mtm;
+  }
+
+  /** Realised + unrealised daily P&L in percent, used by the kill switch. */
+  getDailyPnlPctMTM(lastPrices: Map<string, number>): number {
+    this.rolloverIfNewDay();
+    if (this.dayStartEquity <= 0) return 0;
+    return (
+      ((this.markToMarket(lastPrices) - this.dayStartEquity) /
+        this.dayStartEquity) *
+      100
+    );
+  }
+
   getOpenPosition(symbol: string): Position | undefined {
     return this.positions.get(symbol);
   }

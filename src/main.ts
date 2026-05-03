@@ -37,7 +37,6 @@ const tfMs = tfMinutes * 60_000;
 // Wait this many ms past a candle close before firing the cycle so the
 // exchange has finalised the bar. 5s comfortably covers most spot venues.
 const CYCLE_BUFFER_MS = 5_000;
-const cycleMs = CONFIG.CYCLE_INTERVAL_MIN * 60_000;
 const PROMPT_HASH = systemPromptHash();
 
 let halted = false;
@@ -52,6 +51,7 @@ function buildPacket(
   symbol: string,
   candles: Awaited<ReturnType<typeof fetchOHLCV>>,
   ticker: Awaited<ReturnType<typeof fetchTicker>>,
+  lastPrices: Map<string, number>,
 ): MarketStatePacket {
   const ind = computeIndicators(candles);
   const changes = computeChanges(candles, tfMinutes);
@@ -71,9 +71,11 @@ function buildPacket(
     volume_24h_usd: ticker.quoteVolume24h,
     regime,
     open_position: openPos,
-    equity_usd: exchange.getEquity(),
+    // E2: kill switches see realised + unrealised. equity_high_water stays
+    // realised (a peak is a peak — not an MTM swing).
+    equity_usd: exchange.markToMarket(lastPrices),
     equity_high_water: exchange.getHighWater(),
-    daily_pnl_pct: exchange.getDailyPnlPct(),
+    daily_pnl_pct: exchange.getDailyPnlPctMTM(lastPrices),
     last_3_trades: getLast3TradesSummary(symbol),
   };
 }
@@ -86,11 +88,15 @@ interface SymbolCycleResult {
 async function runSymbolCycle(
   symbol: string,
   cycleStart: number,
+  lastPrices: Map<string, number>,
 ): Promise<SymbolCycleResult> {
   const [candles, ticker] = await Promise.all([
     fetchOHLCV(symbol),
     fetchTicker(symbol),
   ]);
+  // Refresh this symbol's last price as soon as we have it, so MTM in
+  // buildPacket sees a current quote (not the stale entry-price fallback).
+  lastPrices.set(symbol, ticker.last);
 
   // Auto-close on stop-loss / take-profit using the LATEST CLOSED bar's
   // high/low. Mid-price-only checks miss intra-bar wicks.
@@ -109,7 +115,7 @@ async function runSymbolCycle(
     insertTrade(exitTrade);
   }
 
-  const packet = buildPacket(symbol, candles, ticker);
+  const packet = buildPacket(symbol, candles, ticker, lastPrices);
   const brain = costTracker.isExceeded()
     ? syntheticHold(
         symbol,
@@ -118,14 +124,11 @@ async function runSymbolCycle(
     : await decide(packet);
   costTracker.add(brain.usage.cost_usd);
 
-  const id = decisionId(
-    SNAPSHOT.cycleNumber,
-    symbol,
-    brain.intent.action,
-    brain.intent.stop_loss_pct,
-    brain.intent.take_profit_pct,
-    brain.intent.size_pct_of_equity,
-  );
+  // E1: dedupe per (symbol, action, candle window). Restart-safe and
+  // race-safe vs the old (cycleNumber, symbol, action, stop, tp, size) key,
+  // which collided on cycle #1 across restarts.
+  const candleOpenMs = Math.floor(cycleStart / tfMs) * tfMs;
+  const id = decisionId(symbol, brain.intent.action, candleOpenMs);
   const duplicate = decisionExists(id);
 
   const risk = evaluate({
@@ -212,15 +215,11 @@ async function runSymbolCycle(
   return { lastPrice: ticker.last, haltTriggered: risk.verdict === "HALT" };
 }
 
-function flattenAllPositions(lastPrices: Map<string, number>): void {
-  const forceId = decisionId(
-    SNAPSHOT.cycleNumber,
-    "ALL",
-    "FORCE_CLOSE",
-    0,
-    0,
-    0,
-  );
+function flattenAllPositions(
+  lastPrices: Map<string, number>,
+  candleOpenMs: number,
+): void {
+  const forceId = decisionId("ALL", "FORCE_CLOSE", candleOpenMs);
   const forced = exchange.closeAll(lastPrices, forceId);
   for (const t of forced) {
     insertTrade(t);
@@ -240,17 +239,18 @@ async function runCycle(): Promise<void> {
   inFlight = (async () => {
     SNAPSHOT.cycleNumber++;
     const cycleStart = Date.now();
+    const candleOpenMs = Math.floor(cycleStart / tfMs) * tfMs;
     const lastPrices = new Map<string, number>();
 
     for (const symbol of CONFIG.SYMBOLS) {
       if (halted) break;
       try {
-        const res = await runSymbolCycle(symbol, cycleStart);
+        const res = await runSymbolCycle(symbol, cycleStart, lastPrices);
         lastPrices.set(symbol, res.lastPrice);
         if (res.haltTriggered) {
           halted = true;
           logger.error("MAX_DRAWDOWN reached — flattening all positions.");
-          flattenAllPositions(lastPrices);
+          flattenAllPositions(lastPrices, candleOpenMs);
           break;
         }
       } catch (e) {
@@ -287,10 +287,31 @@ function scheduleNext(): void {
   }, delay);
 }
 
-function shutdown(): void {
+/**
+ * E3: SIGTERM/SIGINT/SIGHUP arriving mid-cycle used to drop the cycle's
+ * journal rows because shutdown ran synchronously and exited before the
+ * in-flight runSymbolCycle could insert. Now we await the in-flight cycle
+ * (max 30s grace, so a stuck LLM call can't hang shutdown forever) before
+ * the final `savePaperState` and `closeDb`. Under systemd, set
+ * `TimeoutStopSec=45` so the grace fits inside the default stop window.
+ */
+async function shutdown(): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   if (cycleTimer) clearTimeout(cycleTimer);
+  if (inFlight) {
+    logger.info("shutdown: awaiting in-flight cycle (max 30s)…");
+    try {
+      await Promise.race([
+        inFlight,
+        new Promise<void>((r) => setTimeout(r, 30_000)),
+      ]);
+    } catch (e) {
+      logger.warn(
+        `shutdown: in-flight cycle threw: ${(e as Error).message}`,
+      );
+    }
+  }
   try {
     savePaperState(exchange.exportState());
   } catch (e) {
@@ -303,21 +324,19 @@ function shutdown(): void {
 async function main(): Promise<void> {
   logger.info(
     `Starting crypto-agent-cli — symbols=${CONFIG.SYMBOLS.join(",")} ` +
-      `tf=${CONFIG.TIMEFRAME} interval=${CONFIG.CYCLE_INTERVAL_MIN}m model=${CONFIG.LLM_MODEL}`,
+      `tf=${CONFIG.TIMEFRAME} model=${CONFIG.LLM_MODEL}`,
+  );
+  // E5: replaces the dropped CYCLE_INTERVAL_MIN-vs-TIMEFRAME warning
+  // (M28). Since the scheduler is anchored to candle close + buffer, there
+  // is no separate cycle interval to compare against — describe what the
+  // scheduler actually does.
+  logger.info(
+    `scheduler: aligned to ${CONFIG.TIMEFRAME} close + ${CYCLE_BUFFER_MS / 1000}s buffer`,
   );
   if (restored) {
     logger.info(
       `Restored paper state: equity=${restored.equity.toFixed(2)} ` +
         `positions=${restored.positions.length} day=${restored.currentDay}`,
-    );
-  }
-  // M28: warn when the cycle fires faster than the candle resolution — the
-  // LLM is being asked to re-decide on identical closed-candle indicators.
-  if (CONFIG.CYCLE_INTERVAL_MIN < tfMinutes) {
-    logger.warn(
-      `CYCLE_INTERVAL_MIN=${CONFIG.CYCLE_INTERVAL_MIN}m is shorter than ` +
-        `TIMEFRAME=${CONFIG.TIMEFRAME} (${tfMinutes}m); the LLM will be ` +
-        `queried multiple times per closed candle on the same indicators.`,
     );
   }
 
@@ -327,7 +346,9 @@ async function main(): Promise<void> {
       await runCycle();
       scheduleNext();
     },
-    onQuit: shutdown,
+    onQuit: () => {
+      void shutdown();
+    },
   });
 
   await runCycle();
@@ -335,7 +356,9 @@ async function main(): Promise<void> {
 }
 
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-  process.on(sig, shutdown);
+  process.on(sig, () => {
+    void shutdown();
+  });
 }
 
 main().catch((e) => {

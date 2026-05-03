@@ -34,7 +34,7 @@ npm test            # node:test runner across risk, paper, journal, cost-tracker
 See `.env.example`. Key knobs:
 
 - `SYMBOLS` — comma-separated watchlist (default `BTC/USDT,ETH/USDT`).
-- `TIMEFRAME` / `CYCLE_INTERVAL_MIN` — keep these matched (default `15m` / `15`).
+- `TIMEFRAME` — chart timeframe (default `15m`). Cycles fire on each candle close + a 5 s buffer; there is no separate cycle-interval setting.
 - `LLM_PROVIDER` — `openrouter` (default), `claude-cli`, or `claude-cli-oauth`. See below.
 - `LLM_MODEL` — model id, format depends on provider.
 - `SELF_CONSISTENCY_N` — how many parallel LLM samples per cycle (default 3, majority-vote on `action`).

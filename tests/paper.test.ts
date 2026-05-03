@@ -268,6 +268,55 @@ test("CLOSE long sells into the bid; CLOSE short buys at the ask (N4)", () => {
   assert.equal(shortClose.trade?.exitPrice, 95.3);
 });
 
+test("E2: markToMarket folds in unrealised PnL on a long", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(buy(), q(100), "open"); // 20% of $10k = $2000 notional, fee $2
+  const realised = ex.getEquity();
+  // Drop 10% → unrealised = -10% * $2000 = -$200.
+  const mtm = ex.markToMarket(new Map([["BTC/USDT", 90]]));
+  assert.ok(Math.abs(mtm - (realised - 200)) < 1e-9);
+  // Realised equity unchanged — only the kill switch sees the MTM dip.
+  assert.equal(ex.getEquity(), realised);
+});
+
+test("E2: markToMarket folds in unrealised PnL on a short", () => {
+  const ex = new PaperExchange(10_000);
+  const sell: Intent = {
+    action: "SELL",
+    symbol: "BTC/USDT",
+    size_pct_of_equity: 20,
+    stop_loss_pct: 1,
+    take_profit_pct: 2,
+    confidence: 0.9,
+    rationale: "test",
+  };
+  ex.fill(sell, q(100), "open-short");
+  const realised = ex.getEquity();
+  // Price drops 5% → short profits 5% on $2000 = +$100.
+  const mtm = ex.markToMarket(new Map([["BTC/USDT", 95]]));
+  assert.ok(Math.abs(mtm - (realised + 100)) < 1e-9);
+});
+
+test("E2: markToMarket falls back to entry (zero unrealised) when price is missing", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(buy(), q(100), "open");
+  const realised = ex.getEquity();
+  // Empty map → no lastPrice for BTC/USDT.
+  const mtm = ex.markToMarket(new Map());
+  assert.equal(mtm, realised);
+});
+
+test("E2: getDailyPnlPctMTM tracks unrealised drawdown (defeats daily-loss bypass)", () => {
+  const ex = new PaperExchange(10_000);
+  ex.fill(buy(), q(100), "open"); // entry fee $2 → realised equity $9998
+  // 10% adverse move on $2000 notional = -$200 unrealised. Combined daily
+  // P&L should be roughly (-200 - 2) / 10_000 ≈ -2.02%.
+  const pct = ex.getDailyPnlPctMTM(new Map([["BTC/USDT", 90]]));
+  assert.ok(pct < -1.9 && pct > -2.1, `expected ~-2.02%, got ${pct}`);
+  // Realised-only daily P&L is just the fee — would not trip a 3% daily limit.
+  assert.ok(Math.abs(ex.getDailyPnlPct() - -0.02) < 1e-6);
+});
+
 test("exportState/restoreState round-trip preserves equity, HWM, day, positions, history", () => {
   const ex = new PaperExchange(10_000);
   ex.fill(buy({ symbol: "BTC/USDT" }), q(100), "open-btc");
