@@ -14,6 +14,8 @@ export interface Candle {
 
 export interface Ticker {
   last: number;
+  bid: number;
+  ask: number;
   midPrice: number;
   quoteVolume24h: number;
 }
@@ -71,10 +73,15 @@ export async function fetchTicker(symbol: string): Promise<Ticker> {
   const ex = getExchange();
   const t = await ex.fetchTicker(symbol);
   const last = Number(t.last ?? t.close ?? 0);
-  const bid = Number(t.bid ?? 0);
-  const ask = Number(t.ask ?? 0);
-  const midPrice =
-    bid > 0 && ask > 0 ? (bid + ask) / 2 : last > 0 ? last : 0;
+  const rawBid = Number(t.bid ?? 0);
+  const rawAsk = Number(t.ask ?? 0);
+  const haveQuote = rawBid > 0 && rawAsk > 0;
+  // Some exchanges or low-liquidity pairs return zeros for bid/ask. Fall
+  // back to last so downstream paper fills don't divide by zero or skew on a
+  // missing side; this collapses spread to zero, which is at worst optimistic.
+  const bid = haveQuote ? rawBid : last;
+  const ask = haveQuote ? rawAsk : last;
+  const midPrice = haveQuote ? (rawBid + rawAsk) / 2 : last > 0 ? last : 0;
   if (!(midPrice > 0)) {
     throw new Error(`fetchTicker(${symbol}): no usable price`);
   }
@@ -86,6 +93,8 @@ export async function fetchTicker(symbol: string): Promise<Ticker> {
   }
   return {
     last,
+    bid,
+    ask,
     midPrice,
     quoteVolume24h: Number.isFinite(quoteVolume24h) ? quoteVolume24h : 0,
   };

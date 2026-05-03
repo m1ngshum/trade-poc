@@ -59,6 +59,21 @@ export interface FillResult {
   feePaidUsd: number;
 }
 
+export interface Quote {
+  bid: number;
+  ask: number;
+  mid: number;
+}
+
+export interface PaperExchangeState {
+  equity: number;
+  highWater: number;
+  dayStartEquity: number;
+  currentDay: string;
+  positions: Position[];
+  dailyPnlHistory: DailyPnlSnapshot[];
+}
+
 function utcDateKey(d: Date): string {
   return d.toISOString().slice(0, 10); // YYYY-MM-DD UTC
 }
@@ -157,16 +172,18 @@ export class PaperExchange {
   }
 
   /**
-   * Apply an accepted intent at midPrice. Returns a FillResult describing
-   * what happened (open new, close existing, or no-op for HOLD).
+   * Apply an accepted intent against a live quote. Market orders cross the
+   * spread: BUY/CLOSE-short fill at the ask, SELL/CLOSE-long fill at the bid.
+   * Modelling spread (rather than mid) is the difference between honest paper
+   * PnL and a backtest that quietly skims half a spread per trade.
    */
-  fill(intent: Intent, midPrice: number, decisionId?: string): FillResult {
+  fill(intent: Intent, quote: Quote, decisionId?: string): FillResult {
     this.rolloverIfNewDay();
 
     if (intent.action === "HOLD") {
       return {
         intent,
-        fillPrice: midPrice,
+        fillPrice: quote.mid,
         position: this.positions.get(intent.symbol) ?? null,
         trade: null,
         equityAfter: this.equity,
@@ -179,17 +196,19 @@ export class PaperExchange {
       if (!pos) {
         return {
           intent,
-          fillPrice: midPrice,
+          fillPrice: quote.mid,
           position: null,
           trade: null,
           equityAfter: this.equity,
           feePaidUsd: 0,
         };
       }
-      const trade = this.closePosition(pos, midPrice, decisionId);
+      // Closing a long sells into the bid; closing a short buys at the ask.
+      const exitPrice = pos.side === "long" ? quote.bid : quote.ask;
+      const trade = this.closePosition(pos, exitPrice, decisionId);
       return {
         intent,
-        fillPrice: midPrice,
+        fillPrice: exitPrice,
         position: null,
         trade,
         equityAfter: this.equity,
@@ -204,9 +223,11 @@ export class PaperExchange {
     // deducted so the closed-trade row attributes risk to entry-time equity.
     const equityAtOpen = this.equity;
     const side: "long" | "short" = intent.action === "BUY" ? "long" : "short";
+    // Open a long at the ask, a short at the bid.
+    const fillPrice = side === "long" ? quote.ask : quote.bid;
     const sizeUsd = (intent.size_pct_of_equity / 100) * equityAtOpen;
     const fee = sizeUsd * TAKER_FEE;
-    const qty = midPrice > 0 ? sizeUsd / midPrice : 0;
+    const qty = fillPrice > 0 ? sizeUsd / fillPrice : 0;
 
     this.equity -= fee;
     this.bumpHighWater();
@@ -214,7 +235,7 @@ export class PaperExchange {
     const pos: Position = {
       symbol: intent.symbol,
       side,
-      entryPrice: midPrice,
+      entryPrice: fillPrice,
       sizeUsd,
       qty,
       stopLossPct: intent.stop_loss_pct,
@@ -227,7 +248,7 @@ export class PaperExchange {
 
     return {
       intent,
-      fillPrice: midPrice,
+      fillPrice,
       position: pos,
       trade: null,
       equityAfter: this.equity,
@@ -329,5 +350,30 @@ export class PaperExchange {
     this.history.push(trade);
     this.positions.delete(pos.symbol);
     return trade;
+  }
+
+  /**
+   * Snapshot every persistable field. Trade history is intentionally omitted —
+   * the SQLite `trades` table is the source of truth for closed trades; this
+   * snapshot only covers state that lives nowhere else.
+   */
+  exportState(): PaperExchangeState {
+    return {
+      equity: this.equity,
+      highWater: this.highWater,
+      dayStartEquity: this.dayStartEquity,
+      currentDay: this.currentDay,
+      positions: Array.from(this.positions.values()),
+      dailyPnlHistory: [...this.dailyPnlHistory],
+    };
+  }
+
+  restoreState(s: PaperExchangeState): void {
+    this.equity = s.equity;
+    this.highWater = s.highWater;
+    this.dayStartEquity = s.dayStartEquity;
+    this.currentDay = s.currentDay;
+    this.positions = new Map(s.positions.map((p) => [p.symbol, p]));
+    this.dailyPnlHistory = [...s.dailyPnlHistory];
   }
 }
