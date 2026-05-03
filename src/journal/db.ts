@@ -4,7 +4,12 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { CONFIG } from "../config.js";
 import type { Intent, MarketStatePacket } from "../agent/schema.js";
-import type { Trade } from "../exchange/paper.js";
+import type {
+  DailyPnlSnapshot,
+  PaperExchangeState,
+  Position,
+  Trade,
+} from "../exchange/paper.js";
 
 export interface DecisionRecord {
   id: string;
@@ -142,6 +147,17 @@ function db(): Database.Database {
       closed_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_at);
+
+    CREATE TABLE IF NOT EXISTS paper_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      equity REAL NOT NULL,
+      high_water REAL NOT NULL,
+      day_start_equity REAL NOT NULL,
+      current_day TEXT NOT NULL,
+      positions_json TEXT NOT NULL,
+      daily_pnl_history_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   // Migrate existing journals to add columns introduced after v0.1. SQLite
@@ -324,6 +340,76 @@ export function getStats(): {
     totalPromptTokens: dec.pt,
     totalCompletionTokens: dec.ct,
   };
+}
+
+export function savePaperState(s: PaperExchangeState): void {
+  db()
+    .prepare(
+      `INSERT INTO paper_state
+         (id, equity, high_water, day_start_equity, current_day,
+          positions_json, daily_pnl_history_json, updated_at)
+       VALUES
+         (1, @equity, @high_water, @day_start_equity, @current_day,
+          @positions_json, @daily_pnl_history_json, @updated_at)
+       ON CONFLICT(id) DO UPDATE SET
+         equity = excluded.equity,
+         high_water = excluded.high_water,
+         day_start_equity = excluded.day_start_equity,
+         current_day = excluded.current_day,
+         positions_json = excluded.positions_json,
+         daily_pnl_history_json = excluded.daily_pnl_history_json,
+         updated_at = excluded.updated_at`,
+    )
+    .run({
+      equity: s.equity,
+      high_water: s.highWater,
+      day_start_equity: s.dayStartEquity,
+      current_day: s.currentDay,
+      positions_json: JSON.stringify(s.positions),
+      daily_pnl_history_json: JSON.stringify(s.dailyPnlHistory),
+      updated_at: new Date().toISOString(),
+    });
+}
+
+export function loadPaperState(): PaperExchangeState | null {
+  const row = db()
+    .prepare(
+      `SELECT equity, high_water, day_start_equity, current_day,
+              positions_json, daily_pnl_history_json
+         FROM paper_state WHERE id = 1`,
+    )
+    .get() as
+    | {
+        equity: number;
+        high_water: number;
+        day_start_equity: number;
+        current_day: string;
+        positions_json: string;
+        daily_pnl_history_json: string;
+      }
+    | undefined;
+  if (!row) return null;
+  try {
+    return {
+      equity: row.equity,
+      highWater: row.high_water,
+      dayStartEquity: row.day_start_equity,
+      currentDay: row.current_day,
+      positions: JSON.parse(row.positions_json) as Position[],
+      dailyPnlHistory: JSON.parse(
+        row.daily_pnl_history_json,
+      ) as DailyPnlSnapshot[],
+    };
+  } catch (e) {
+    // Better to start fresh than to crash on corrupted JSON. The operator
+    // sees the warning in the agent log; the journal row stays untouched
+    // until the next savePaperState overwrites it.
+    // eslint-disable-next-line no-console
+    console.warn(
+      `loadPaperState: corrupted row, ignoring: ${(e as Error).message}`,
+    );
+    return null;
+  }
 }
 
 export function closeDb(): void {

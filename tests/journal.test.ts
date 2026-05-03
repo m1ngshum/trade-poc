@@ -10,8 +10,11 @@ import {
   decisionId,
   getRecentDecisions,
   insertDecision,
+  loadPaperState,
+  savePaperState,
   setDbPathForTesting,
 } from "../src/journal/db.js";
+import type { Position, DailyPnlSnapshot } from "../src/exchange/paper.js";
 
 test("decisionId is deterministic for the same inputs", () => {
   const a = decisionId(7, "BTC/USDT", "BUY", 1, 2, 10);
@@ -53,6 +56,7 @@ test("journal in WAL mode and round-trips the new columns", () => {
         regime: "ranging",
         open_position: { side: "none", entry_price: 0, unrealized_pnl_pct: 0 },
         equity_usd: 10000,
+        equity_high_water: 10000,
         daily_pnl_pct: 0,
         last_3_trades: [],
       },
@@ -144,6 +148,7 @@ test("legacy journals get migrated with new columns", () => {
         regime: "ranging",
         open_position: { side: "none", entry_price: 0, unrealized_pnl_pct: 0 },
         equity_usd: 10000,
+        equity_high_water: 10000,
         daily_pnl_pct: 0,
         last_3_trades: [],
       },
@@ -179,6 +184,82 @@ test("legacy journals get migrated with new columns", () => {
     ]) {
       assert.ok(cols.includes(expected), `missing column: ${expected}`);
     }
+  } finally {
+    closeDb();
+    setDbPathForTesting(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("paper_state round-trips and the latest save wins (H18)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "trade-paper-state-"));
+  const path = join(dir, "test.db");
+  setDbPathForTesting(path);
+  try {
+    assert.equal(loadPaperState(), null);
+
+    const positions: Position[] = [
+      {
+        symbol: "BTC/USDT",
+        side: "long",
+        entryPrice: 100,
+        sizeUsd: 2000,
+        qty: 20,
+        stopLossPct: 1,
+        takeProfitPct: 2,
+        openedAt: "2026-05-02T12:00:00.000Z",
+        openDecisionId: "open-1",
+        equityAtOpen: 10_000,
+      },
+      {
+        symbol: "ETH/USDT",
+        side: "short",
+        entryPrice: 50,
+        sizeUsd: 500,
+        qty: 10,
+        stopLossPct: 1,
+        takeProfitPct: 2,
+        openedAt: "2026-05-02T12:01:00.000Z",
+        openDecisionId: "open-2",
+        equityAtOpen: 10_000,
+      },
+    ];
+    const dailyPnlHistory: DailyPnlSnapshot[] = [
+      { day: "2026-05-01", equityStart: 10_000, equityEnd: 10_120 },
+    ];
+    savePaperState({
+      equity: 10_120,
+      highWater: 10_200,
+      dayStartEquity: 10_120,
+      currentDay: "2026-05-02",
+      positions,
+      dailyPnlHistory,
+    });
+
+    const loaded = loadPaperState();
+    assert.ok(loaded);
+    assert.equal(loaded?.equity, 10_120);
+    assert.equal(loaded?.highWater, 10_200);
+    assert.equal(loaded?.dayStartEquity, 10_120);
+    assert.equal(loaded?.currentDay, "2026-05-02");
+    assert.equal(loaded?.positions.length, 2);
+    assert.equal(loaded?.positions[0]?.symbol, "BTC/USDT");
+    assert.equal(loaded?.positions[1]?.side, "short");
+    assert.equal(loaded?.dailyPnlHistory.length, 1);
+    assert.equal(loaded?.dailyPnlHistory[0]?.equityEnd, 10_120);
+
+    // Save again with different values — upsert must overwrite, not append.
+    savePaperState({
+      equity: 9_900,
+      highWater: 10_200,
+      dayStartEquity: 10_120,
+      currentDay: "2026-05-02",
+      positions: [],
+      dailyPnlHistory,
+    });
+    const second = loadPaperState();
+    assert.equal(second?.equity, 9_900);
+    assert.equal(second?.positions.length, 0);
   } finally {
     closeDb();
     setDbPathForTesting(null);
