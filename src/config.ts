@@ -31,6 +31,10 @@ const ConfigSchema = z
     DAILY_LOSS_LIMIT_PCT: z.coerce.number().positive().default(3),
     MAX_DRAWDOWN_PCT: z.coerce.number().positive().default(15),
     MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.6),
+    // Fraction of equity put at risk on each accepted non-HOLD trade.
+    // Final position size = min(RISK_PER_TRADE_PCT / stop_loss_pct * 100,
+    // MAX_POSITION_PCT). Lower = safer; the LLM-proposed size is overridden.
+    RISK_PER_TRADE_PCT: z.coerce.number().positive().default(0.5),
     LLM_DAILY_BUDGET_USD: z.coerce.number().nonnegative().default(5),
 
     LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),

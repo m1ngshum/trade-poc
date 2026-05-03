@@ -22,6 +22,13 @@ npm run journal     # last 30 decisions in a table
 npm run stats       # win rate, PnL, token spend $
 ```
 
+## Tests
+
+```bash
+npm run typecheck   # strict TS, must be clean before any change lands
+npm test            # node:test runner across risk, paper, journal, cost-tracker, data
+```
+
 ## Configuration (.env)
 
 See `.env.example`. Key knobs:
@@ -31,7 +38,10 @@ See `.env.example`. Key knobs:
 - `LLM_PROVIDER` — `openrouter` (default), `claude-cli`, or `claude-cli-oauth`. See below.
 - `LLM_MODEL` — model id, format depends on provider.
 - `SELF_CONSISTENCY_N` — how many parallel LLM samples per cycle (default 3, majority-vote on `action`).
-- `MAX_POSITION_PCT`, `DAILY_LOSS_LIMIT_PCT`, `MAX_DRAWDOWN_PCT` — risk guardrails. The drawdown breach halts the loop with a banner.
+- `MAX_POSITION_PCT`, `DAILY_LOSS_LIMIT_PCT`, `MAX_DRAWDOWN_PCT` — risk guardrails. The drawdown breach is anchored to the equity **high-water mark** (not `INITIAL_EQUITY`), halts the loop, and force-flattens any open position before stopping.
+- `RISK_PER_TRADE_PCT` (default 0.5) — the risk engine sizes every accepted non-HOLD trade as `min(RISK_PER_TRADE_PCT / stop_loss_pct * 100, MAX_POSITION_PCT)`. The LLM's proposed size is ignored — sizing is deterministic.
+- `MIN_CONFIDENCE` (default 0.6) — non-HOLD intents below this are rejected. HOLDs always pass.
+- `LLM_DAILY_BUDGET_USD` (default 5) — once today's accumulated LLM spend exceeds this, cycles short-circuit to synthetic HOLD without calling the model.
 
 ### LLM providers
 
@@ -77,8 +87,10 @@ CCXT  →  indicators  →  MarketStatePacket  →  LLM (×N, vote)
 ## Notes
 
 - With `LLM_PROVIDER=openrouter`, the static system prompt is sent with `cache_control: ephemeral`, which OpenRouter forwards to Claude models. With `LLM_PROVIDER=claude-cli`, caching is whatever the harness applies internally.
-- Stop-loss / take-profit are enforced between cycles (not real exchange orders) by checking the open position against the latest mid-price each cycle.
-- The journal is the source of truth; `stats.ts` reads it, `print-journal.ts` reads it. Equity does not persist across restarts in v0.1 — the `INITIAL_EQUITY` resets each launch.
+- Stop-loss / take-profit are simulated as resting orders against the latest **closed** bar's high/low at the start of each cycle. Triggers fill at the stop or TP price (optimistic — gap-through slippage is not modeled in v0.1). When stop and TP both fall inside the same bar, the stop wins.
+- Fetched OHLCV always drops the still-forming live candle, so decisions are made on settled bars only.
+- Position sizing is computed deterministically from `RISK_PER_TRADE_PCT` and the LLM's proposed `stop_loss_pct`, capped at `MAX_POSITION_PCT`. The LLM's `size_pct_of_equity` is advisory.
+- The journal is the source of truth; `stats.ts` reads it, `print-journal.ts` reads it. Equity, high-water mark, and the halted state do **not** persist across restarts in v0.1 — `INITIAL_EQUITY` resets each launch.
 
 ---
 
@@ -206,17 +218,19 @@ tail -f data/agent.log
 ### E) Force each risk-engine reject path (sanity check before letting it run unattended)
 
 ```bash
-# 1) SIZE_CAP — small position cap, watch a >1% intent get rejected.
-MAX_POSITION_PCT=1 npm run dev
+# 1) LOW_CONFIDENCE — every non-HOLD intent should get rejected.
+MIN_CONFIDENCE=0.99 npm run dev
 
 # 2) DAILY_LOSS_LIMIT — first losing close should trip it.
 DAILY_LOSS_LIMIT_PCT=0.01 npm run dev
 
-# 3) MAX_DRAWDOWN — first losing close should HALT the loop.
+# 3) MAX_DRAWDOWN — first losing close should HALT the loop AND force-close
+#    any open position. `npm run journal` will show one ACCEPT followed by a
+#    FORCE_CLOSE trade row.
 MAX_DRAWDOWN_PCT=0.01 npm run dev
 ```
 
-In all three cases, `npm run journal` afterwards will show the reject reason in the rightmost column.
+In all three cases, `npm run journal` afterwards will show the reject reason in the rightmost column. Note: setting `MAX_POSITION_PCT=1` no longer triggers a SIZE_CAP reject — sizing is now risk-based and clamped to the cap, so the cap is always satisfied.
 
 ### F) Reset a session (wipe paper state and journal)
 

@@ -57,22 +57,39 @@ function buildPacket(
     regime,
     open_position: openPos,
     equity_usd: exchange.getEquity(),
+    equity_high_water: exchange.getHighWater(),
     daily_pnl_pct: exchange.getDailyPnlPct(),
     last_3_trades: getLast3TradesSummary(symbol),
   };
 }
 
-async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void> {
+interface SymbolCycleResult {
+  lastPrice: number;
+  haltTriggered: boolean;
+}
+
+async function runSymbolCycle(
+  symbol: string,
+  cycleStart: number,
+): Promise<SymbolCycleResult> {
   const [candles, ticker] = await Promise.all([
     fetchOHLCV(symbol),
     fetchTicker(symbol),
   ]);
 
-  // Auto-close on stop-loss / take-profit before asking the LLM.
-  const exitTrade = exchange.checkExits(symbol, ticker.last);
+  // Auto-close on stop-loss / take-profit using the LATEST CLOSED bar's
+  // high/low. Mid-price-only checks miss intra-bar wicks.
+  const lastBar = candles[candles.length - 1];
+  const exitTrade = lastBar
+    ? exchange.checkExits(symbol, {
+        high: lastBar.high,
+        low: lastBar.low,
+        close: lastBar.close,
+      })
+    : null;
   if (exitTrade) {
     logger.info(
-      `Auto-exit ${symbol} at ${ticker.last}: pnl=${exitTrade.pnlPct.toFixed(2)}%`,
+      `Auto-exit ${symbol}: pnl=${exitTrade.pnlPct.toFixed(2)}% @ ${exitTrade.exitPrice}`,
     );
     insertTrade(exitTrade);
   }
@@ -102,11 +119,17 @@ async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void>
     duplicateOrderId: duplicate,
   });
 
+  // The risk engine may resize the LLM's proposed intent (C3 sizing
+  // override). Use the engine-output intent for the fill and journal so
+  // the trade log reflects what was actually executed; the original
+  // LLM text is preserved separately in `raw_response`.
+  const intentForFill = risk.intent ?? brain.intent;
+
   let fillPrice: number | undefined;
   let trade: typeof exitTrade = null;
 
   if (risk.verdict === "ACCEPT") {
-    const fill = exchange.fill(brain.intent, ticker.midPrice, id);
+    const fill = exchange.fill(intentForFill, ticker.midPrice, id);
     fillPrice = fill.fillPrice;
     if (fill.trade) {
       trade = fill.trade;
@@ -119,7 +142,7 @@ async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void>
     timestamp: packet.timestamp,
     symbol,
     market_state: packet,
-    intent: brain.intent,
+    intent: intentForFill,
     risk_verdict: risk.verdict,
     reject_reason: risk.reason,
     fill_price: fillPrice,
@@ -140,7 +163,7 @@ async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void>
     nextCycleAt: cycleStart + cycleMs,
     symbol,
     packet,
-    intent: brain.intent,
+    intent: intentForFill,
     brain,
     verdict: risk.verdict,
     rejectReason: risk.reason,
@@ -156,15 +179,30 @@ async function runSymbolCycle(symbol: string, cycleStart: number): Promise<void>
   bus.emit("cycle", snap);
 
   logger.info(
-    `cycle ${SNAPSHOT.cycleNumber} ${symbol} ${brain.intent.action} ` +
+    `cycle ${SNAPSHOT.cycleNumber} ${symbol} ${intentForFill.action} ` +
       `verdict=${risk.verdict}${risk.reason ? `(${risk.reason})` : ""} ` +
       `equity=${exchange.getEquity().toFixed(2)} ` +
       `tokens=${brain.usage.prompt_tokens}+${brain.usage.completion_tokens}`,
   );
 
-  if (risk.verdict === "HALT") {
-    halted = true;
-    logger.error("MAX_DRAWDOWN reached — halting loop.");
+  return { lastPrice: ticker.last, haltTriggered: risk.verdict === "HALT" };
+}
+
+function flattenAllPositions(lastPrices: Map<string, number>): void {
+  const forceId = decisionId(
+    SNAPSHOT.cycleNumber,
+    "ALL",
+    "FORCE_CLOSE",
+    0,
+    0,
+    0,
+  );
+  const forced = exchange.closeAll(lastPrices, forceId);
+  for (const t of forced) {
+    insertTrade(t);
+    logger.error(
+      `HALT-flatten ${t.symbol} ${t.side}: pnl=${t.pnlPct.toFixed(2)}% @ ${t.exitPrice}`,
+    );
   }
 }
 
@@ -172,11 +210,19 @@ async function runCycle(): Promise<void> {
   if (halted) return;
   SNAPSHOT.cycleNumber++;
   const cycleStart = Date.now();
+  const lastPrices = new Map<string, number>();
 
   for (const symbol of CONFIG.SYMBOLS) {
     if (halted) break;
     try {
-      await runSymbolCycle(symbol, cycleStart);
+      const res = await runSymbolCycle(symbol, cycleStart);
+      lastPrices.set(symbol, res.lastPrice);
+      if (res.haltTriggered) {
+        halted = true;
+        logger.error("MAX_DRAWDOWN reached — flattening all positions.");
+        flattenAllPositions(lastPrices);
+        break;
+      }
     } catch (e) {
       const msg = (e as Error).message;
       SNAPSHOT.lastError = `${symbol}: ${msg}`;
