@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { CONFIG } from "../config.js";
+import { logger } from "../logger.js";
 import type { Intent, MarketStatePacket } from "../agent/schema.js";
 import type {
   DailyPnlSnapshot,
@@ -67,32 +68,28 @@ export interface TradeRow {
 }
 
 /**
- * Deterministic decision id. Includes the cycle number plus the intent
- * fingerprint (symbol, action, stop, tp, size) so two cycles can never
- * collide and a crash-restart that re-issues the same intent in the same
- * cycle stays idempotent. The previous implementation hashed the wall-clock
- * timestamp, which made collisions essentially impossible — defeating the
- * point of dedupe entirely.
+ * Deterministic decision id keyed to (symbol, action, candleOpenMs).
+ *
+ * The previous version included `cycleNumber` in the hash. Because
+ * `SNAPSHOT.cycleNumber` resets to 0 on every process start, an identical
+ * intent issued on cycle #1 of run-1 and cycle #1 of run-2 — not unlikely
+ * given the C3 sizing override produces the same `size_pct_of_equity` for
+ * the same stop — would collide post-restart and silently `DUPLICATE_ORDER`
+ * (E1). Anchoring on the candle open instead gives the dedupe meaningful
+ * semantics: "no two identical-action intents for the same symbol within
+ * the same candle window," which is restart-safe and race-safe (force-cycle
+ * × scheduled timer collapse to one row per candle).
+ *
+ * SL/TP/size are intentionally excluded so the C3 sizing override can't
+ * manufacture pseudo-uniqueness across an otherwise-duplicate intent.
  */
 export function decisionId(
-  cycleNumber: number,
   symbol: string,
   action: string,
-  stopLossPct: number,
-  takeProfitPct: number,
-  sizePctOfEquity: number,
+  candleOpenMs: number,
 ): string {
   return createHash("sha256")
-    .update(
-      [
-        cycleNumber,
-        symbol,
-        action,
-        stopLossPct,
-        takeProfitPct,
-        sizePctOfEquity,
-      ].join("|"),
-    )
+    .update([symbol, action, candleOpenMs].join("|"))
     .digest("hex");
 }
 
@@ -196,7 +193,7 @@ export function insertDecision(rec: DecisionRecord): void {
        @reject_reason, @fill_price, @equity_after, @model, @prompt_tokens, @completion_tokens,
        @cycle_number, @prompt_version, @system_prompt_hash, @raw_response, @cost_usd)
   `);
-  stmt.run({
+  const info = stmt.run({
     id: rec.id,
     timestamp: rec.timestamp,
     symbol: rec.symbol,
@@ -215,6 +212,12 @@ export function insertDecision(rec: DecisionRecord): void {
     raw_response: rec.raw_response ?? null,
     cost_usd: rec.cost_usd ?? null,
   });
+  // E4: surface dropped duplicates so the next race cause is visible.
+  if (info.changes === 0) {
+    logger.warn(
+      `insertDecision: duplicate id ${rec.id} ignored (already journaled)`,
+    );
+  }
 }
 
 export function decisionExists(id: string): boolean {
@@ -231,7 +234,7 @@ export function insertTrade(t: Trade): void {
       (@id, @open_decision_id, @close_decision_id, @symbol, @side,
        @entry_price, @exit_price, @size_pct, @pnl_pct, @pnl_usd, @opened_at, @closed_at)
   `);
-  stmt.run({
+  const info = stmt.run({
     id: t.id,
     open_decision_id: t.openDecisionId ?? null,
     close_decision_id: t.closeDecisionId ?? null,
@@ -245,6 +248,12 @@ export function insertTrade(t: Trade): void {
     opened_at: t.openedAt,
     closed_at: t.closedAt,
   });
+  // E4: same as insertDecision — log the drop instead of swallowing it.
+  if (info.changes === 0) {
+    logger.warn(
+      `insertTrade: duplicate id ${t.id} ignored (already journaled)`,
+    );
+  }
 }
 
 export function getRecentDecisions(n = 20): DecisionRow[] {

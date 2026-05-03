@@ -10,26 +10,47 @@ import {
   decisionId,
   getRecentDecisions,
   insertDecision,
+  insertTrade,
   loadPaperState,
   savePaperState,
   setDbPathForTesting,
 } from "../src/journal/db.js";
-import type { Position, DailyPnlSnapshot } from "../src/exchange/paper.js";
+import { logger } from "../src/logger.js";
+import type {
+  Position,
+  DailyPnlSnapshot,
+  Trade,
+} from "../src/exchange/paper.js";
 
-test("decisionId is deterministic for the same inputs", () => {
-  const a = decisionId(7, "BTC/USDT", "BUY", 1, 2, 10);
-  const b = decisionId(7, "BTC/USDT", "BUY", 1, 2, 10);
-  assert.equal(a, b);
+// E1: dedupe is now keyed on (symbol, action, candleOpenMs). The old key
+// included cycleNumber + sl/tp/size, which collided across restarts because
+// SNAPSHOT.cycleNumber resets to 0 on every process start.
+const CANDLE_A = 1_700_000_000_000;
+const CANDLE_B = CANDLE_A + 15 * 60_000;
+
+test("decisionId is deterministic for (symbol, action, candleOpenMs)", () => {
+  assert.equal(
+    decisionId("BTC/USDT", "BUY", CANDLE_A),
+    decisionId("BTC/USDT", "BUY", CANDLE_A),
+  );
 });
 
-test("decisionId differs when any input changes", () => {
-  const base = decisionId(7, "BTC/USDT", "BUY", 1, 2, 10);
-  assert.notEqual(base, decisionId(8, "BTC/USDT", "BUY", 1, 2, 10));
-  assert.notEqual(base, decisionId(7, "ETH/USDT", "BUY", 1, 2, 10));
-  assert.notEqual(base, decisionId(7, "BTC/USDT", "SELL", 1, 2, 10));
-  assert.notEqual(base, decisionId(7, "BTC/USDT", "BUY", 1.5, 2, 10));
-  assert.notEqual(base, decisionId(7, "BTC/USDT", "BUY", 1, 3, 10));
-  assert.notEqual(base, decisionId(7, "BTC/USDT", "BUY", 1, 2, 11));
+test("decisionId differs when symbol, action, or candle changes", () => {
+  const base = decisionId("BTC/USDT", "BUY", CANDLE_A);
+  assert.notEqual(base, decisionId("ETH/USDT", "BUY", CANDLE_A));
+  assert.notEqual(base, decisionId("BTC/USDT", "SELL", CANDLE_A));
+  assert.notEqual(base, decisionId("BTC/USDT", "BUY", CANDLE_B));
+});
+
+test("E1: identical intent in same candle stays stable across simulated restart", () => {
+  // The old key included cycleNumber: cycle #1 of run-1 and cycle #1 of
+  // run-2 (after restart) would collide. The new key has no cycleNumber, so
+  // restart never affects the id — restart-safety here means the SAME id
+  // for the same (symbol, action, candle), and decisionExists can therefore
+  // legitimately reject the second call as DUPLICATE_ORDER.
+  const beforeRestart = decisionId("BTC/USDT", "BUY", CANDLE_A);
+  const afterRestart = decisionId("BTC/USDT", "BUY", CANDLE_A);
+  assert.equal(beforeRestart, afterRestart);
 });
 
 test("journal in WAL mode and round-trips the new columns", () => {
@@ -38,7 +59,7 @@ test("journal in WAL mode and round-trips the new columns", () => {
   setDbPathForTesting(path);
   try {
     insertDecision({
-      id: decisionId(1, "BTC/USDT", "BUY", 1, 2, 10),
+      id: decisionId("BTC/USDT", "BUY", CANDLE_A),
       timestamp: "2026-05-02T12:00:00.000Z",
       symbol: "BTC/USDT",
       market_state: {
@@ -130,7 +151,7 @@ test("legacy journals get migrated with new columns", () => {
   try {
     // Touch the journal so the migration runs.
     insertDecision({
-      id: decisionId(99, "BTC/USDT", "HOLD", 0.5, 0.5, 0),
+      id: decisionId("BTC/USDT", "HOLD", CANDLE_B),
       timestamp: "2026-05-02T12:00:00.000Z",
       symbol: "BTC/USDT",
       market_state: {
@@ -185,6 +206,107 @@ test("legacy journals get migrated with new columns", () => {
       assert.ok(cols.includes(expected), `missing column: ${expected}`);
     }
   } finally {
+    closeDb();
+    setDbPathForTesting(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("E4: insertDecision warns when INSERT OR IGNORE drops a duplicate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "trade-journal-dup-"));
+  const path = join(dir, "test.db");
+  setDbPathForTesting(path);
+  const warnings: string[] = [];
+  const origWarn = logger.warn.bind(logger);
+  logger.warn = ((msg: string) => {
+    warnings.push(msg);
+    return logger;
+  }) as typeof logger.warn;
+  try {
+    const id = decisionId("BTC/USDT", "BUY", CANDLE_A);
+    const baseRecord = {
+      id,
+      timestamp: "2026-05-02T12:00:00.000Z",
+      symbol: "BTC/USDT",
+      market_state: {
+        symbol: "BTC/USDT",
+        timestamp: "2026-05-02T12:00:00.000Z",
+        price: 100,
+        change_1h_pct: 0,
+        change_4h_pct: 0,
+        change_24h_pct: 0,
+        rsi_14: 50,
+        macd_histogram: 0,
+        ema200_distance_pct: 0,
+        atr_14: 1,
+        volume_24h_usd: 1,
+        regime: "ranging" as const,
+        open_position: { side: "none" as const, entry_price: 0, unrealized_pnl_pct: 0 },
+        equity_usd: 10_000,
+        equity_high_water: 10_000,
+        daily_pnl_pct: 0,
+        last_3_trades: [],
+      },
+      intent: {
+        action: "BUY" as const,
+        symbol: "BTC/USDT",
+        size_pct_of_equity: 10,
+        stop_loss_pct: 1,
+        take_profit_pct: 2,
+        confidence: 0.8,
+        rationale: "test",
+      },
+      risk_verdict: "ACCEPT" as const,
+      equity_after: 9_990,
+      model: "test",
+      prompt_tokens: 0,
+      completion_tokens: 0,
+    };
+    insertDecision(baseRecord);
+    insertDecision(baseRecord); // duplicate id — silently ignored before E4
+    assert.ok(
+      warnings.some((m) => m.includes(`duplicate id ${id}`)),
+      `expected duplicate-warn; got ${JSON.stringify(warnings)}`,
+    );
+  } finally {
+    logger.warn = origWarn;
+    closeDb();
+    setDbPathForTesting(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("E4: insertTrade warns when INSERT OR IGNORE drops a duplicate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "trade-journal-dup-trade-"));
+  const path = join(dir, "test.db");
+  setDbPathForTesting(path);
+  const warnings: string[] = [];
+  const origWarn = logger.warn.bind(logger);
+  logger.warn = ((msg: string) => {
+    warnings.push(msg);
+    return logger;
+  }) as typeof logger.warn;
+  try {
+    const trade: Trade = {
+      id: "trade-dup-1",
+      symbol: "BTC/USDT",
+      side: "long",
+      entryPrice: 50_000,
+      exitPrice: 51_000,
+      sizePct: 10,
+      pnlPct: 2,
+      pnlUsd: 20,
+      openedAt: "2026-05-02T12:00:00.000Z",
+      closedAt: "2026-05-02T12:30:00.000Z",
+    };
+    insertTrade(trade);
+    insertTrade(trade);
+    assert.ok(
+      warnings.some((m) => m.includes(`duplicate id ${trade.id}`)),
+      `expected duplicate-warn; got ${JSON.stringify(warnings)}`,
+    );
+  } finally {
+    logger.warn = origWarn;
     closeDb();
     setDbPathForTesting(null);
     rmSync(dir, { recursive: true, force: true });

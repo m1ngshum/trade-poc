@@ -14,7 +14,6 @@ const ConfigSchema = z
           .filter(Boolean),
       ),
     TIMEFRAME: z.string().default("15m"),
-    CYCLE_INTERVAL_MIN: z.coerce.number().positive().default(15),
 
     LLM_PROVIDER: z
       .enum(["openrouter", "claude-cli", "claude-cli-oauth"])
