@@ -11,7 +11,8 @@
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "OPENROUTER_API_KEY=test tsx --test tests/*.test.ts",
     "journal": "tsx src/scripts/print-journal.ts",
-    "stats": "tsx src/scripts/stats.ts"
+    "stats": "tsx src/scripts/stats.ts",
+    "pairs": "tsx src/scripts/select-pairs.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
