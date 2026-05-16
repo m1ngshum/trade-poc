@@ -1,0 +1,40 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    # Order matters: a dependency matches the first group it qualifies for.
+    # Security-sensitive packages (exchange + LLM SDKs + DB driver) get their
+    # own PR so a malicious patch can't ride along with unrelated bumps.
+    groups:
+      security-sensitive:
+        patterns:
+          - "ccxt"
+          - "openai"
+          - "@anthropic*"
+          - "better-sqlite3"
+          - "zod"
+      production-dependencies:
+        dependency-type: "production"
+        update-types: ["minor", "patch"]
+      development-dependencies:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"

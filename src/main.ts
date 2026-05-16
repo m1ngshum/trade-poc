@@ -340,16 +340,22 @@ async function main(): Promise<void> {
     );
   }
 
-  renderDashboard({
-    onForceCycle: async () => {
-      if (cycleTimer) clearTimeout(cycleTimer);
-      await runCycle();
-      scheduleNext();
-    },
-    onQuit: () => {
-      void shutdown();
-    },
-  });
+  // Ink can't attach to a non-interactive process.stdin (launchd, pm2, nohup,
+  // CI) and crashes — fall back to plain logging in those environments.
+  if (process.stdin.isTTY && process.env.HEADLESS !== "1") {
+    renderDashboard({
+      onForceCycle: async () => {
+        if (cycleTimer) clearTimeout(cycleTimer);
+        await runCycle();
+        scheduleNext();
+      },
+      onQuit: () => {
+        void shutdown();
+      },
+    });
+  } else {
+    logger.info("Running in headless mode (no Ink dashboard)");
+  }
 
   await runCycle();
   scheduleNext();
