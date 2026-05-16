@@ -174,18 +174,25 @@ async function main(): Promise<void> {
       `tf=${CONFIG.TIMEFRAME} interval=${CONFIG.CYCLE_INTERVAL_MIN}m model=${CONFIG.LLM_MODEL}`,
   );
 
-  renderDashboard({
-    onForceCycle: async () => {
-      if (cycleTimer) clearTimeout(cycleTimer);
-      await runCycle();
-      scheduleNext();
-    },
-    onQuit: () => {
-      if (cycleTimer) clearTimeout(cycleTimer);
-      closeDb();
-      process.exit(0);
-    },
-  });
+  // Headless when stdin isn't a TTY (launchd, pm2, nohup, CI) — Ink can't
+  // attach to a non-interactive process.stdin and crashes.
+  const headless = !process.stdin.isTTY || process.env.HEADLESS === "1";
+  if (!headless) {
+    renderDashboard({
+      onForceCycle: async () => {
+        if (cycleTimer) clearTimeout(cycleTimer);
+        await runCycle();
+        scheduleNext();
+      },
+      onQuit: () => {
+        if (cycleTimer) clearTimeout(cycleTimer);
+        closeDb();
+        process.exit(0);
+      },
+    });
+  } else {
+    logger.info("Running in headless mode (no Ink dashboard)");
+  }
 
   await runCycle();
   scheduleNext();
