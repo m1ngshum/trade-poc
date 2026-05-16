@@ -19,40 +19,50 @@ export interface TickerSnapshot {
 
 type ExchangeCls = new (opts?: Record<string, unknown>) => InstanceType<typeof ccxt.Exchange>;
 
-function makeExchange(): InstanceType<typeof ccxt.Exchange> {
+function safeNumber(v: unknown, fallback = 0): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+let _exchange: InstanceType<typeof ccxt.Exchange> | null = null;
+
+function getExchange(): InstanceType<typeof ccxt.Exchange> {
+  if (_exchange) return _exchange;
   const id = CONFIG.EXCHANGE;
   const Cls = (ccxt as unknown as Record<string, ExchangeCls>)[id];
   if (!Cls) throw new Error(`unsupported exchange: ${id}`);
-  return new Cls({ enableRateLimit: true });
+  _exchange = new Cls({ enableRateLimit: true });
+  return _exchange;
 }
 
-const exchange = makeExchange();
-
 export async function fetchOHLCV(symbol: string, limit = 250): Promise<Candle[]> {
-  const rows = await exchange.fetchOHLCV(symbol, CONFIG.TIMEFRAME, undefined, limit);
-  return rows.map((r: (number | undefined)[]) => ({
-    timestamp: Number(r[0]),
-    open: Number(r[1]),
-    high: Number(r[2]),
-    low: Number(r[3]),
-    close: Number(r[4]),
-    volume: Number(r[5]),
-  }));
+  const rows = await getExchange().fetchOHLCV(symbol, CONFIG.TIMEFRAME, undefined, limit);
+  return rows.map((r: (number | undefined)[]) => {
+    const close = safeNumber(r[4]);
+    return {
+      timestamp: safeNumber(r[0]),
+      open: safeNumber(r[1], close),
+      high: safeNumber(r[2], close),
+      low: safeNumber(r[3], close),
+      close,
+      volume: safeNumber(r[5]),
+    };
+  });
 }
 
 export async function fetchTicker(symbol: string): Promise<TickerSnapshot> {
-  const t = await exchange.fetchTicker(symbol);
-  const last = Number(t.last ?? t.close ?? 0);
-  if (!Number.isFinite(last) || last <= 0) {
+  const t = await getExchange().fetchTicker(symbol);
+  const last = safeNumber(t.last ?? t.close);
+  if (last <= 0) {
     throw new Error(`fetchTicker(${symbol}): invalid last price ${t.last}`);
   }
-  const bid = Number(t.bid ?? last);
-  const ask = Number(t.ask ?? last);
+  const bid = safeNumber(t.bid, last);
+  const ask = safeNumber(t.ask, last);
   const midPrice = (bid > 0 && ask > 0) ? (bid + ask) / 2 : last;
   return {
     symbol,
     last,
     midPrice,
-    quoteVolume24h: Number(t.quoteVolume ?? 0),
+    quoteVolume24h: safeNumber(t.quoteVolume),
   };
 }

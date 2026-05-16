@@ -73,14 +73,14 @@ export function computeIndicators(candles: Candle[]): Indicators {
   let atrVal: number | null = null;
   let macdHist = 0;
 
+  // trading-signals returns null during warmup when called with replace=false;
+  // it does not throw. Trust the null and coalesce with the previous value.
   for (const c of candles) {
-    try { rsiVal = rsi.update(c.close, false) ?? rsiVal; } catch { /* warmup */ }
-    try { emaVal = ema200.update(c.close, false) ?? emaVal; } catch { /* warmup */ }
-    try { atrVal = atr.update({ high: c.high, low: c.low, close: c.close }, false) ?? atrVal; } catch { /* warmup */ }
-    try {
-      const r = macd.update(c.close, false);
-      if (r) macdHist = r.histogram;
-    } catch { /* warmup */ }
+    rsiVal = (rsi.update(c.close, false) as number | null) ?? rsiVal;
+    emaVal = (ema200.update(c.close, false) as number | null) ?? emaVal;
+    atrVal = atr.update({ high: c.high, low: c.low, close: c.close }, false) ?? atrVal;
+    const m = macd.update(c.close, false);
+    if (m) macdHist = m.histogram;
   }
 
   const lastCandle = candles[candles.length - 1];

@@ -6,7 +6,17 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
+    # Order matters: a dependency matches the first group it qualifies for.
+    # Security-sensitive packages (exchange + LLM SDKs) get their own PR so a
+    # malicious patch can't ride along with unrelated bumps.
     groups:
+      security-sensitive:
+        patterns:
+          - "ccxt"
+          - "openai"
+          - "@anthropic*"
+          - "better-sqlite3"
+          - "zod"
       production-dependencies:
         dependency-type: "production"
         update-types: ["minor", "patch"]
@@ -22,6 +32,7 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    open-pull-requests-limit: 5
     groups:
       actions:
         patterns: ["*"]
